@@ -1,0 +1,35 @@
+# /etc/systemd/system/dsh-line-inbound.service  (staged; operator installs)
+# DSH LINE inbound listener — mirrors dsh-discord-inbound.service hardening.
+[Unit]
+Description=DSH LINE inbound listener (Messaging API webhook -> DSH session RPC; replies via LINE Push API)
+After=network-online.target dsh.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/dsh-line/dsh_line_inbound.py
+# Same platform-listener trust class as the Discord lane (dsh-discord user);
+# dedicated user creation is an optional future operator hardening.
+User=dsh-discord
+Group=dsh-discord
+# Operator-staged credentials (root-owned 0600 under /root/dsh-line/)
+LoadCredential=channel-secret:/root/dsh-line/channel-secret
+LoadCredential=channel-access-token:/root/dsh-line/channel-access-token
+# Persistent conversation->session mapping + dedupe + profile cache
+StateDirectory=dsh-line-inbound
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+MemoryMax=256M
+# failure isolation: listener crash never touches dsh.service, Discord lane,
+# webgate, translator, or schedules
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

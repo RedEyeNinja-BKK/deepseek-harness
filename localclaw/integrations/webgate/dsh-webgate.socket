@@ -1,0 +1,14 @@
+# dsh-webgate.socket — AF_UNIX socket created by systemd (NOT by the service),
+# group-restricted to `dsh`. Owner = dedicated webgate identity.
+[Unit]
+Description=DSH webgate CloakBrowser authority seam (socket)
+
+[Socket]
+ListenStream=/run/dsh-webgate/gate.sock
+SocketUser=dsh-webgate
+SocketGroup=dsh
+SocketMode=0660
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

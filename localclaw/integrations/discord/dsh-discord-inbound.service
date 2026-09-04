@@ -1,0 +1,32 @@
+[Unit]
+Description=DSH Discord inbound listener (Gateway -> DSH session RPC; replies via existing Phase-4 REST MCP)
+After=network-online.target dsh.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/dsh-inbound/dsh_discord_inbound.py
+User=dsh-discord
+Group=dsh-discord
+# Same operator-staged credential as the Phase-4 REST gate (read-only bind).
+LoadCredential=discord-bot-token:/root/dsh-discord/bot-token
+# Persistent conversation→session mapping + dedupe state lives here
+# (systemd StateDirectory: created/owned for User=dsh-discord at
+# /var/lib/dsh-discord-inbound; PERSISTS across restarts/reboots).
+StateDirectory=dsh-discord-inbound
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=256M
+# failure isolation: listener crash/degradation never touches dsh.service,
+# the REST gate, webgate, translator, or schedules
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

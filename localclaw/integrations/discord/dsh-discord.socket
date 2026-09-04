@@ -1,0 +1,20 @@
+[Unit]
+Description=DSH Discord gate socket (operator-approved privileged Discord lane)
+PartOf=dsh-discord.service
+
+[Socket]
+ListenStream=/run/dsh-discord/gate.sock
+SocketUser=dsh-discord
+SocketGroup=dsh
+SocketMode=0660
+# NOTE (Hermes finding 10 verification): RuntimeDirectoryUser/Group are not
+# valid in [Socket] (systemd-analyze verify rejects them — silently ignored).
+# The runtime dir is therefore root:root; mode 0755 gives uid dsh (group dsh
+# via SocketGroup on the socket itself, 0660) traversal to connect. The gate
+# receives the listening fd from systemd and never needs to open the dir.
+RuntimeDirectory=dsh-discord
+RuntimeDirectoryMode=0755
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,40 @@
+# dsh-webgate.service — DSH web authority gate.
+# Dedicated unprivileged identity (dsh-webgate) — NEVER dsh/turnstone/hermes/openclaw.
+# Bearer enters ONLY via LoadCredential (operator stages the source file root:root 0600).
+[Service]
+User=dsh-webgate
+Group=dsh-webgate
+ExecStart=/opt/turnstone/tools/cbvenv/bin/python /opt/dsh-webgate/webgate.py
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+# MemoryDenyWriteExecute REMOVED (2026-09-01): the Playwright node driver's
+# V8 JIT requires executable mappings — with it node dies at
+# v8::OS::SetPermissions errno 12 (journal 02:12:40). Confirmed runtime cause.
+CapabilityBoundingSet=
+UMask=0077
+# SystemCallFilter REMOVED: V8/node syscall surface breaks under @system-service
+# Proxy inheritance explicitly cleared (Hermes finding 12)
+UnsetEnvironment=HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy
+# Bearer: systemd materializes at $CREDENTIALS_DIRECTORY/manager-token,
+# readable only by this service's uid. Source file MUST be root:root 0600 with
+# non-traversable-for-dsh parents (deployment preflight asserts this).
+LoadCredential=manager-token:/root/dsh-webgate/manager-token
+# NOTE: no authority knobs in the environment — Manager origin and profile are
+# compiled into the root-owned code (Hermes finding 1).
+[Install]
+WantedBy=multi-user.target
