@@ -1,0 +1,39 @@
+# settings.example.yaml — reconstructed example of the accepted model settings
+#
+# The live deployment's settings file is runtime state (owned by the dsh user,
+# mode 0600) and is NEVER committed. This example documents the accepted values
+# in the upstream settings schema shape (docs/config-catalog.md at tag
+# dsh-v0.1.1-rc.2). Verify keys against the schema of your installed version.
+#
+# Accepted deployment values captured here:
+#   - normal DSH default lane  = switchyard-smart-dsh (OpenAI-compatible gateway)
+#   - DSH-side contextWindow   = 262144
+#   - maxTokens                = 16384
+#   - declared reasoning efforts for that model: off / low / high
+#   - agent default reasoning effort = low
+#   - (the dedicated gold session is pinned per-session to a separate bounded
+#      lane via session.selectModel at runtime — not a settings default)
+
+agent-default-model:
+  provider: switchyard
+  model: smart-dsh
+  reasoningEffort: low
+
+llm-pi-ai:
+  providers:
+    switchyard:
+      # OpenAI-compatible gateway endpoint (deployment-specific).
+      baseUrl: "https://<your-gateway>/v1"
+      # Credential is staged by the operator (root-owned env file / credential
+      # service) — never inline here. See config/env.example.
+      # apiKey: <from env/credential store, not in this file>
+      models:
+        smart-dsh:
+          id: smart-dsh
+          name: Smart DSH (switchyard)
+          contextWindow: 262144
+          maxTokens: 16384
+          reasoningEfforts:
+            off: off
+            low: low
+            high: high

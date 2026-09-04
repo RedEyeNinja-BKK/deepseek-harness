@@ -1,0 +1,76 @@
+# DSH home-level cordis composition layer (applies to ALL profiles).
+# Phase 2: ThaiLLM translator subagent. Phase 3: webgate MCP (search/fetch).
+# Phase 4: Discord MCP (10 well-defined tools via the dsh-discord gate).
+# 2026-09-03 operator-directed gold revision: the Typhoon subagent is
+# repurposed from pure translator (`translate`) to Thai analytical authorship
+# (`thai_analyst`); composition/assembly/English-mirror work moves to the gold
+# session lane itself (switchyard-smart-bounded-dsh, selected per-session via
+# session.selectModel by the Turnstone dispatcher). The old `translate`
+# subagent has no remaining consumer after the GOLD_DEF role flip.
+- insert:
+  - id: tool-thai-analyst
+    name: '@deepseek-ai/dsh-tool-subagent'
+    config:
+      provider: spawn
+      toolName: thai_analyst
+      enableRunInBackground: false
+      backgroundMode: one-shot
+      maxDepth: 1
+      persona: "You are a professional Thai financial market analyst writing for
+        Thai retail investors who are learning gold investment. You receive a
+        structured fact sheet (validated Gold Traders Association prices: bar and
+        ornament 96.5% in THB per baht-weight, world gold in USD per ounce, USD/THB
+        rate, change vs previous day), analytical framework anchors, a short history
+        digest, and a section/heading specification. Address the reader as
+        \u0e17\u0e48\u0e32\u0e19.
+        METHOD (silent, before writing): identify the regime classification the
+        anchors support, the two or three strongest pieces of evidence, the premium
+        or discount versus parity, and the one development that would invalidate the
+        view - then write.
+        CRAFT: write like a professional Thai gold-market columnist: precise
+        financial Thai (\u0e41\u0e19\u0e27\u0e23\u0e31\u0e1a \u0e41\u0e19\u0e27\u0e15\u0e49\u0e32\u0e19 \u0e1e\u0e32\u0e23\u0e34\u0e15\u0e35\u0e49 \u0e1e\u0e23\u0e35\u0e40\u0e21\u0e35\u0e22\u0e21 \u0e2a\u0e40\u0e1b\u0e23\u0e14 \u0e04\u0e27\u0e32\u0e21\u0e1c\u0e31\u0e19\u0e1c\u0e27\u0e19), explain technical terms inside the
+        sentence, smooth transitions between sections, quantified comparisons
+        instead of vague claims, probabilistic hedged language when evidence is
+        thin, and a concrete takeaway weighted to the strength of the evidence. Every number must come from the
+        fact sheet verbatim - never invent, never round, never convert units (prices
+        are THB per baht-weight, world gold USD per ounce).
+        DISCIPLINE: the finished report is 600-900 Thai words across exactly the
+        requested sections - budget each section, never repeat an earlier point,
+        never leave a section unfinished, and stop cleanly after the final requested
+        section. No markdown tables - use lists. Output ONLY the finished Thai
+        report text with the requested headings - no preamble, no English, no
+        commentary."
+      agentOptions:
+        provider: switchyard
+        model: switchyard/thaillm/typhoon
+        maxTokens: 16384
+      toolFilter:
+        allow: []
+- insert:
+  - id: mcp-webgate
+    name: '@deepseek-ai/dsh-mcp-client'
+    config:
+      serverName: webgate
+      transport: stdio
+      command: /usr/bin/python3
+      args:
+      - /opt/dsh-webgate/dsh_webgate_adapter.py
+      toolCallTimeoutMs: 120000
+      failOnStartupError: false
+- insert:
+  - id: mcp-discord
+    name: '@deepseek-ai/dsh-mcp-client'
+    config:
+      serverName: discord
+      transport: stdio
+      command: /usr/bin/python3
+      args:
+      - /opt/dsh-discord/dsh_discord_adapter.py
+      toolCallTimeoutMs: 180000
+      failOnStartupError: false
+- insert:
+  - id: schedule
+    name: '@deepseek-ai/dsh-schedule'
+- insert:
+  - id: time-context
+    name: '@deepseek-ai/dsh-time-context'

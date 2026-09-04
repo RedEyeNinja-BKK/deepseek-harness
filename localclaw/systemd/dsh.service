@@ -1,0 +1,20 @@
+[Unit]
+Description=DeepSeek Harness
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dsh
+Group=dsh
+WorkingDirectory=/opt/dsh/workspace
+Environment=DSH_HOME=/opt/dsh/home
+EnvironmentFile=/etc/dsh/dsh.env
+ExecStart=/opt/dsh/node_modules/.bin/dsh web --no-open --trusted-host <funnel-host>:8445
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
