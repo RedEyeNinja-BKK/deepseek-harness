@@ -35,11 +35,22 @@ Content-Length and any Transfer-Encoding rejected; queue capacity check +
 reservation + executor submission atomic BEFORE the 200 ack (no post-ack
 drop); bounded shutdown drain enforcing SHUTDOWN_GRACE_S; chunker hardened
 (str input, boundary-tested 4500/22500/22501).
+
+v4 (Increment 1, 2026-09-04): person identity + approved-family-group
+admission + own-mention-only gating. New durable admission state file
+(admission-state.json, flock-guarded, operator CLI dsh_line_admission.py).
+Trust boundary: admission/mention classification runs BEFORE any DSH
+session/model/tool work; unknown groups are captured as PENDING candidates
+(no DSH access, no leave until the operator declines or the 14-day window
+expires), unadmitted DM outsiders are denied, and group dispatch requires
+LINE's own-mention metadata (isSelf==True) — @All and textual lookalikes
+never summon DSH. F3 final-output filtering unchanged.
 """
 
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import hmac
 import http.server
@@ -87,6 +98,8 @@ INFLIGHT_STALE_S = 600         # crashed claim recovery threshold
 STATE_DIR_ENV = os.environ.get("STATE_DIRECTORY")
 STATE_DIR = Path(STATE_DIR_ENV.split(":")[0]) if STATE_DIR_ENV else Path("/var/lib/dsh-line-inbound")
 STATE_PATH = STATE_DIR / "line-state.json"
+ADMISSION_PATH = STATE_DIR / "admission-state.json"
+ADMISSION_LOCK_PATH = STATE_DIR / "admission.lock"
 
 PROFILE_TTL_S = 7 * 24 * 3600
 
@@ -335,6 +348,404 @@ def recover_stale_claims(state: dict) -> int:
             if not save_state(state):
                 STATE_UNAVAILABLE.set()
         return recovered
+
+
+# --- admission & identity (Increment 1; separate durable state file) ------------
+#
+# Identity model:
+#   person identity        = DSH-owned record "p-<uuid>" — represents the human,
+#                            never a transport identifier.
+#   channel identity       = bindings inside a person record (line/discord);
+#                            binding two channels to one person requires an
+#                            EXPLICIT operator command — display names, profile
+#                            names, similarity or model inference NEVER merge.
+#   conversation identity  = LINE DM / LINE group|room (and later Discord
+#                            channels) — membership is not identity.
+#   admission state        = per-conversation state machine (UNKNOWN -> PENDING
+#                            -> APPROVED | DECLINED) + per-person DM eligibility
+#                            (observed in an APPROVED group's roster, or an
+#                            explicit operator grant).
+#
+# Durable state: STATE_DIR/admission-state.json (schema v1) under flock on
+# STATE_DIR/admission.lock so the operator CLI (dsh_line_admission.py, sudo)
+# and this service never corrupt each other. Malformed/unreadable admission
+# state is FAIL-CLOSED: every admission denies, nothing dispatches, CRITICAL
+# logged. PENDING candidates never gain sessions, model calls, or tools; the
+# LINE leave capability (already on this credential surface) is exercised on
+# DECLINED/expired candidates by the maintenance loop, never on PENDING (the
+# operator needs the candidate alive to approve it).
+
+GROUP_ROSTER_MAX = 64                     # bounded roster (family scale)
+LEAVE_MAX_ATTEMPTS = 5
+ADM_STATES = ("PENDING", "APPROVED", "DECLINED")
+DEFAULT_ADMISSION = {"version": 1, "persons": {}, "groups": {},
+                     "dmGrants": {"line": {}}, "dmDenials": {"line": {}}}
+
+
+def admission_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def _default_admission() -> dict:
+    return json.loads(json.dumps(DEFAULT_ADMISSION))
+
+
+def _validate_admission(adm) -> bool:
+    if not isinstance(adm, dict) or adm.get("version") != 1:
+        return False
+    persons, groups = adm.get("persons"), adm.get("groups")
+    grants = (adm.get("dmGrants") or {}).get("line")
+    denials = (adm.get("dmDenials") or {}).get("line")
+    if not isinstance(persons, dict) or not isinstance(groups, dict):
+        return False
+    if grants is not None and not isinstance(grants, dict):
+        return False
+    if denials is not None and not isinstance(denials, dict):
+        return False
+    for g in groups.values():
+        if not isinstance(g, dict) or g.get("state") not in ADM_STATES:
+            return False
+        if not isinstance(g.get("roster", []), list):
+            return False
+    for p in persons.values():
+        if not isinstance(p, dict) or not isinstance(p.get("bindings"), dict):
+            return False
+        if not isinstance((p.get("bindings") or {}).get("line", []), list):
+            return False
+    return True
+
+
+def load_admission() -> tuple[dict, bool]:
+    """Returns (admission, healthy). healthy=False -> deny-all (fail-closed)."""
+    try:
+        lock_fd = os.open(ADMISSION_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_SH)
+            raw = (ADMISSION_PATH.read_text(encoding="utf-8")
+                   if ADMISSION_PATH.exists() else "")
+        finally:
+            os.close(lock_fd)
+        if not raw.strip():
+            return json.loads(json.dumps(DEFAULT_ADMISSION)), True
+        adm = json.loads(raw)
+        if not _validate_admission(adm):
+            log.critical("admission state MALFORMED — deny-all engaged (fail-closed)")
+            return json.loads(json.dumps(DEFAULT_ADMISSION)), False
+        return adm, True
+    except Exception as exc:
+        log.critical("admission state UNREADABLE (%s) — deny-all engaged",
+                     exc.__class__.__name__)
+        return json.loads(json.dumps(DEFAULT_ADMISSION)), False
+
+
+def save_admission(adm: dict) -> bool:
+    """flock-exclusive atomic write (tmp + fsync + replace + dir fsync)."""
+    try:
+        if not _validate_admission(adm):
+            log.error("refusing to persist malformed admission state")
+            return False
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(ADMISSION_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            tmp = STATE_DIR / f"admission.tmp.{os.getpid()}.{threading.get_ident()}"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(adm))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, ADMISSION_PATH)
+            dfd = os.open(STATE_DIR, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+            return True
+        finally:
+            os.close(lock_fd)
+    except OSError as exc:
+        log.error("admission save FAILED: %s", exc.__class__.__name__)
+        return False
+
+
+def mention_gate_self(mentionees) -> bool:
+    """TRUE only for LINE's own-mention metadata (isSelf is True). @All
+    (type == "all") and textual lookalikes are intentionally ignored — no
+    regex/string matching exists by design."""
+    if not isinstance(mentionees, list):
+        return False
+    return any(isinstance(m, dict) and m.get("isSelf") is True for m in mentionees)
+
+
+def group_state(adm: dict, gid: str) -> str:
+    g = adm.get("groups", {}).get(gid)
+    return g.get("state", "UNKNOWN") if isinstance(g, dict) else "UNKNOWN"
+
+
+def person_for_line(adm: dict, line_user: str) -> dict | None:
+    """Person bound to a LINE user. None = unbound. The user appearing in more
+    than one person, or twice inside one person, is corrupt state -> fail-closed
+    marker dict (never guess)."""
+    matches = []
+    for p in adm.get("persons", {}).values():
+        if not isinstance(p, dict):
+            continue
+        binds = (p.get("bindings") or {}).get("line") or []
+        matches.extend(p for _ in range(sum(1 for x in binds if x == line_user)))
+    if len(matches) > 1:
+        log.critical("person bindings corrupt (%d match this LINE user) — "
+                     "fail-closed", len(matches))
+        return {"__corrupt__": True}
+    return matches[0] if matches else None
+
+
+def line_user_dm_eligible(adm: dict, line_user: str) -> bool:
+    """DM eligibility precedence (operator directive 4): explicit operator
+    DENY > approved-group roster eligibility > explicit grant. A deny is
+    durable until an explicit grant-dm clears it; identity never confers
+    capability; names are never consulted."""
+    if line_user in (adm.get("dmDenials", {}).get("line") or {}):
+        return False
+    for g in adm.get("groups", {}).values():
+        if isinstance(g, dict) and g.get("state") == "APPROVED" \
+                and line_user in (g.get("roster") or []):
+            return True
+    return line_user in (adm.get("dmGrants", {}).get("line") or {})
+
+
+def line_user_admitted(adm: dict, line_user: str) -> bool:
+    """DM admission predicate (review fix): CURRENT eligibility only - an
+    APPROVED-group roster entry or an active operator grant. A person RECORD
+    is pure identity and NEVER confers capability, so revocation (grant
+    removal + roster strip) is authoritative. Corrupt bindings deny."""
+    p = person_for_line(adm, line_user)
+    if p and p.get("__corrupt__"):
+        return False
+    return line_user_dm_eligible(adm, line_user)
+
+
+def transact_admission(mutator):
+    """One exclusive-lock read-modify-write transaction on the admission file
+    (review fix: closes the service/CLI lost-update race). Load + validate +
+    mutator(adm) -> (adm2, proceed) + post-validate + atomic write, all under
+    a single flock. mutator does NO network I/O. mutator(adm) returns
+    (adm2, result); a FALSY result aborts WITHOUT persisting; otherwise the
+    post-validated state is persisted and (adm2, result, True) is returned
+    (result = the mutator's payload, e.g. the bound person). (None, None,
+    False) when the store is unhealthy (fail-closed)."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(ADMISSION_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            raw = (ADMISSION_PATH.read_text(encoding="utf-8")
+                   if ADMISSION_PATH.exists() else "")
+            try:
+                adm = (json.loads(raw) if raw.strip()
+                       else json.loads(json.dumps(DEFAULT_ADMISSION)))
+            except Exception:
+                log.critical("admission state UNREADABLE - transaction "
+                             "refused (fail-closed)")
+                return None, False
+            if not _validate_admission(adm):
+                log.critical("admission state MALFORMED - transaction "
+                             "refused (fail-closed)")
+                return None, False
+            adm2, result = mutator(adm)
+            if not result:
+                return adm2, None, False
+            if not _validate_admission(adm2):
+                log.error("transaction produced invalid admission state - "
+                          "refusing to persist (fail-closed)")
+                return adm2, None, False
+            tmp = STATE_DIR / f"admission.tmp.{os.getpid()}.{threading.get_ident()}"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(adm2))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, ADMISSION_PATH)
+            dfd = os.open(STATE_DIR, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+            return adm2, result, True
+        finally:
+            os.close(lock_fd)
+    except OSError as exc:
+        log.error("admission transaction FAILED: %s", exc.__class__.__name__)
+        return None, None, False
+
+
+def new_person(adm: dict, label: str | None) -> dict:
+    pid = "p-" + uuid.uuid4().hex
+    adm["persons"][pid] = {"personId": pid, "label": label,
+                           "bindings": {"line": [], "discord": []},
+                           "dmEligible": {"line": False, "discord": False},
+                           "createdAt": admission_now(),
+                           "updatedAt": admission_now()}
+    return adm["persons"][pid]
+
+
+def observe_group_message(adm: dict, source_type: str, gid: str,
+                          user_id: str | None,
+                          summary: dict | None = None) -> tuple[dict, str]:
+    """State transition for one observation from a group|room. Pure dict
+    transform (caller persists). Events: NEW_PENDING, PENDING_SEEN, ROSTER
+    (roster grew), APPROVED_SEEN, DECLINED_SEEN."""
+    groups = adm.setdefault("groups", {})
+    g = groups.get(gid)
+    if not isinstance(g, dict):
+        # Single-family-group invariant (operator directive 1): at most ONE
+        # PENDING candidate (while nothing is approved) and at most ONE
+        # APPROVED group globally. A DIFFERENT unknown group arriving while a
+        # candidate/approved group exists is recorded DECLINED with
+        # leaveRequested (already-implemented LINE leave removes it); it never
+        # becomes a second candidate and never gains DSH access.
+        has_candidate = any(isinstance(x, dict) and x.get("state") in
+                            ("PENDING", "APPROVED")
+                            for x in groups.values())
+        if has_candidate:
+            groups[gid] = {"state": "DECLINED", "kind": source_type or "group",
+                           "summary": summary, "firstSeen": admission_now(),
+                           "decidedAt": admission_now(),
+                           "decidedBy": "single-family-group-invariant",
+                           "roster": [], "leaveRequested": True,
+                           "left": False, "leaveAttempts": 0}
+            return adm, "REJECTED_EXTRA_GROUP"
+        groups[gid] = {"state": "PENDING", "kind": source_type or "group",
+                       "summary": summary, "firstSeen": admission_now(),
+                       "decidedAt": None, "decidedBy": None, "roster": [],
+                       "leaveRequested": False, "left": False,
+                       "leaveAttempts": 0}
+        return adm, "NEW_PENDING"
+    if summary and not g.get("summary"):
+        g["summary"] = summary
+    if g.get("state") == "APPROVED":
+        # roster bootstrap (operator directive 3): ONLY the approved family
+        # group accumulates a roster; denied users are not rostered.
+        denied = user_id in (adm.get("dmDenials", {}).get("line") or {})
+        if (user_id and not denied and user_id not in g["roster"]
+                and len(g["roster"]) < GROUP_ROSTER_MAX):
+            g["roster"].append(user_id)
+            return adm, "ROSTER"
+        return adm, "APPROVED_SEEN"
+    if g.get("state") == "PENDING":
+        # minimal candidate metadata only - NO roster accumulation
+        return adm, "PENDING_SEEN"
+    return adm, "DECLINED_SEEN"
+
+
+def classify_event(event: dict, adm: dict) -> dict:
+    """Admission + mention classifier — THE trust boundary. Runs BEFORE any
+    DSH session/model/tool work; fails closed in every ambiguous case."""
+    out = {"action": "SKIP", "source_type": None, "target_id": None,
+           "user_id": None, "reason": ""}
+    if event.get("mode") != "active":
+        out["reason"] = "standby event"
+        return out
+    etype = event.get("type")
+    source = event.get("source") or {}
+    source_type = source.get("type")
+    out["source_type"] = source_type
+    if etype == "join" and source_type in ("group", "room"):
+        target = source.get("groupId") or source.get("roomId")
+        out.update(action="OBSERVE_PENDING", target_id=target,
+                   reason="bot joined unverified conversation — candidate capture")
+        return out
+    if etype != "message":
+        out["reason"] = f"event type {etype}"
+        return out
+    message = event.get("message") or {}
+    user_id = source.get("userId")
+    out["user_id"] = user_id
+    if source_type == "user":
+        target = source.get("userId")
+        out["target_id"] = target
+        if not target:
+            out["reason"] = "DM without userId"
+            return out
+        if line_user_admitted(adm, target):
+            out.update(action="DISPATCH_DM",
+                       reason="admitted DM (mention not required)")
+        else:
+            out.update(action="DENIED_DM", reason="unadmitted outsider DM")
+        return out
+    if source_type in ("group", "room"):
+        target = source.get("groupId") or source.get("roomId")
+        out["target_id"] = target
+        if not target:
+            out["reason"] = "group/room without id"
+            return out
+        st = group_state(adm, target)
+        mentionees = ((message.get("mention") or {}).get("mentionees")) or []
+        if st == "APPROVED":
+            out["self_mentioned"] = mention_gate_self(mentionees)
+            out.update(action="APPROVED_GROUP_MSG",
+                       reason="approved group message (roster bootstrap; "
+                              "dispatch only on own-mention)")
+        elif st == "PENDING":
+            out.update(action="OBSERVE_PENDING",
+                       reason="pending approval — no DSH access")
+        elif st == "DECLINED":
+            out.update(action="DENIED_GROUP", reason="declined/revoked group")
+        else:
+            out.update(action="OBSERVE_PENDING",
+                       reason="unknown group — captured as PENDING candidate")
+        return out
+    out["reason"] = f"unknown source type {source_type}"
+    return out
+
+
+def admission_maintenance_once() -> None:
+    """Perform requested leaves via the LINE API already available to this
+    integration (rejected extra groups / revoked groups). PENDING candidates
+    are NEVER expired automatically (operator-driven decisions only). Two-
+    phase: state transitions in lock-held transactions; leave HTTP calls
+    OUTSIDE the lock; outcomes recorded in a second transaction."""
+    targets = []
+
+    def _collect_leaves(adm):
+        for gid, g in adm.get("groups", {}).items():
+            if not isinstance(g, dict):
+                continue
+            if (g.get("leaveRequested") and not g.get("left")
+                    and g.get("leaveAttempts", 0) < LEAVE_MAX_ATTEMPTS):
+                g["leaveAttempts"] = g.get("leaveAttempts", 0) + 1
+                targets.append((gid, g.get("kind") or "group"))
+        return adm, bool(targets)
+    adm, _payload, _persisted = transact_admission(_collect_leaves)
+    if adm is None:
+        return
+    ok_ids = []
+    for gid, kind in targets:
+        try:
+            line_request("POST", f"/{kind}/{gid}/leave", label="leave")
+            ok_ids.append(gid)
+            log.info("admission: left %s %s", kind, gid)
+        except LineHttpError as exc:
+            log.error("admission: leave failed (%s %s status=%s attempt=%d)",
+                      kind, gid, exc.status,
+                      (adm.get("groups", {}).get(gid) or {}).get("leaveAttempts"))
+    if ok_ids:
+        def _record(adm):
+            for gid in ok_ids:
+                g = adm.get("groups", {}).get(gid)
+                if isinstance(g, dict):
+                    g["left"] = True
+                    g["leftAt"] = admission_now()
+            return adm, True
+        transact_admission(_record)  # noqa: result unused
+
+
+def admission_maintenance_loop(stop_event: threading.Event) -> None:
+    while not stop_event.wait(60.0):
+        try:
+            admission_maintenance_once()
+        except CredError as exc:
+            log.error("admission maintenance skipped (credential: %s)",
+                      exc.__class__.__name__)
+        except Exception as exc:
+            log.error("admission maintenance error: %s", exc.__class__.__name__)
 
 
 # --- LINE API client (sanitized logging: class + label + status only) ----------
@@ -729,7 +1140,8 @@ def pending_retry_loop(state: dict, stop_event: threading.Event) -> None:
 
 
 def build_envelope(source_type: str, target_id: str, display_name: str | None,
-                   message: dict, event: dict, dispatch_id: str) -> str:
+                   message: dict, event: dict, dispatch_id: str,
+                   person_id: str | None = None) -> str:
     ctx = {
         "platform": "line",
         "line_source_type": source_type,
@@ -740,6 +1152,7 @@ def build_envelope(source_type: str, target_id: str, display_name: str | None,
         "message_type": message.get("type"),
         "content_length": len(message.get("text") or ""),
         "is_redelivery": bool((event.get("deliveryContext") or {}).get("isRedelivery")),
+        "person_id": person_id,
         "dispatch_id": dispatch_id,
     }
     text = message.get("text") or ""
@@ -750,41 +1163,88 @@ def build_envelope(source_type: str, target_id: str, display_name: str | None,
     return f"[line message] {json.dumps(ctx, ensure_ascii=False)}\n{text}"
 
 
-def should_dispatch(event: dict) -> tuple[bool, str | None, str]:
-    """Trust/interest gate. Returns (dispatch, target_id, source_type)."""
-    if event.get("mode") != "active" or event.get("type") != "message":
-        return False, None, ""
-    source = event.get("source") or {}
-    source_type = source.get("type")
-    if source_type == "user":
-        target = source.get("userId")
-        return (bool(target), target, source_type) if target else (False, None, source_type)
-    if source_type in ("group", "room"):
-        target = source.get("groupId") or source.get("roomId")
-        if not target:
-            return False, None, source_type
-        message = event.get("message") or {}
-        mentionees = ((message.get("mention") or {}).get("mentionees")) or []
-        mentioned = any(m.get("isSelf") or m.get("type") == "all" for m in mentionees)
-        return (mentioned, target, source_type)
-    return False, None, source_type or ""
-
-
 def handle_event(state: dict, event: dict) -> None:
     if STATE_UNAVAILABLE.is_set():
-        log.error("state persistence unavailable — event DROPPED for redelivery "
+        log.error("state persistence unavailable - event DROPPED for redelivery "
                   "(fail-closed)")
         return
-    dispatch, target_id, source_type = should_dispatch(event)
-    if not dispatch:
-        log.info("skipped event (type=%s mode=%s source=%s mention-gated)",
-                 event.get("type"), event.get("mode"), source_type)
+    # Trust boundary (Increment 1): (1) webhook signature/shape is verified in
+    # the HTTP layer; (2) admission + mention classification happens here,
+    # BEFORE any DSH session/model/tool work. Denied/unknown events never
+    # reach get_or_create_session or session.prompt.
+    adm, adm_ok = load_admission()
+    if not adm_ok:
+        log.critical("admission state unhealthy - event DROPPED for redelivery "
+                     "(fail-closed, deny-all)")
         return
+    decision = classify_event(event, adm)
+    action = decision["action"]
     message = event.get("message") or {}
     message_id = str(message.get("id") or "")
-    if not message_id:
+
+    if action == "APPROVED_GROUP_MSG":
+        # Operator directive 3: roster FIRST (identity bootstrap only - the
+        # message body is never stored anywhere), then apply the mention gate
+        # separately; ordinary chatter never creates/resumes a DSH session.
+        target_id = decision["target_id"]
+        source_type = decision["source_type"]
+        user_id = decision["user_id"]
+        if not target_id or not user_id:
+            return
+
+        def _roster_txn(adm):
+            if group_state(adm, target_id) != "APPROVED":
+                return adm, False
+            adm, _ev = observe_group_message(adm, source_type, target_id,
+                                             user_id)
+            return adm, True
+
+        adm_r, _roster_payload, roster_ok = transact_admission(_roster_txn)
+        if adm_r is None or not roster_ok:
+            log.critical("approved-group roster transaction failed/unhealthy "
+                         "- message %s not rostered (fail-closed)", message_id)
+            return
+        if not decision.get("self_mentioned"):
+            log.info("admission gate: approved-group chatter rostered sender "
+                     "%s; no DSH own-mention - silent (never dispatched)",
+                     user_id)
+            return
+        log.info("admission gate: approved-group own-mention dispatch "
+                 "(sender %s rostered)", user_id)
+    elif action == "DISPATCH_DM":
+        target_id = decision["target_id"]
+        source_type = decision["source_type"]
+    else:
+        # OBSERVE_PENDING (candidate capture / metadata refresh),
+        # DENIED_DM, DENIED_GROUP, SKIP, SKIP_SILENT, standby, non-message.
+        log.info("admission gate: %s (%s) src=%s target=%s user=%s",
+                 action, decision["reason"], decision["source_type"],
+                 decision["target_id"], decision["user_id"])
+        if action == "OBSERVE_PENDING" and decision["target_id"]:
+            stype = decision["source_type"] if decision["source_type"] in (
+                "group", "room") else "group"
+            summary = None
+            if group_state(adm, decision["target_id"]) == "UNKNOWN":
+                try:
+                    raw = line_request("GET",
+                                       f"/{stype}/{decision['target_id']}/summary",
+                                       label="group-summary")
+                    name = (raw or {}).get("groupName")
+                    summary = {"name": name} if name else None
+                except Exception:
+                    summary = None
+            captured = {}
+            transact_admission(lambda a: _capture_txn(
+                a, decision["source_type"], decision["target_id"],
+                decision["user_id"], summary, captured))
+            if captured.get("kind") == "REJECTED_EXTRA_GROUP":
+                log.info("admission: extra group %s rejected "
+                         "(single-family-group invariant) - leave requested",
+                         decision["target_id"])
         return
 
+    if not message_id:
+        return
     conv_key = f"{source_type}:{target_id}"
     with conversation_lock(conv_key):
         with STATE_LOCK:
@@ -799,15 +1259,47 @@ def handle_event(state: dict, event: dict) -> None:
         with STATE_LOCK:
             pending = has_pending(state, message_id)
         if pending and not pending.get("inFlight"):
-            log.info("redelivery of undelivered msg %s — retrying push", message_id)
+            log.info("redelivery of undelivered msg %s - retrying push", message_id)
             deliver_reply(state, message_id, target_id, pending["reply"])
             return
         if pending:  # in flight elsewhere
             return
 
-        user_id = (event.get("source") or {}).get("userId") or target_id
-        group_id = (event.get("source") or {}).get("groupId") \
-            if source_type == "group" else None
+        user_id = decision["user_id"] or target_id
+        group_id = target_id if source_type == "group" else None
+
+        # admission revalidation + person binding in ONE transaction (review
+        # fix): the dispatch decision is re-checked against the FINAL admission
+        # state under the exclusive lock immediately BEFORE any DSH
+        # session/model/tool work (rostering already happened above for
+        # approved-group messages).
+        def _dispatch_txn(adm):
+            if source_type == "group" and group_state(adm, group_id) != "APPROVED":
+                return adm, False
+            if source_type == "user" and not line_user_dm_eligible(adm, user_id):
+                log.critical("DM eligibility withdrawn before dispatch - "
+                             "message %s aborted (fail-closed)", message_id)
+                return adm, False
+            p = person_for_line(adm, user_id)
+            if p and p.get("__corrupt__"):
+                log.critical("person binding corrupt - message %s NOT "
+                             "dispatched (fail-closed)", message_id)
+                return adm, False
+            if p is None:
+                np_ = new_person(adm, None)
+                np_["bindings"]["line"].append(user_id)
+                np_["dmEligible"]["line"] = True
+                np_["updatedAt"] = admission_now()
+                p = np_
+            return adm, p
+
+        adm_final, person, persisted = transact_admission(_dispatch_txn)
+        if adm_final is None or not persisted or not person:
+            log.critical("admission transaction failed/unhealthy or admission "
+                         "withdrawn - message %s aborted (fail-closed)",
+                         message_id)
+            return
+
         display_name = get_display_name(source_type, group_id, user_id, state)
 
         sid = get_or_create_session(state, conv_key)
@@ -818,7 +1310,8 @@ def handle_event(state: dict, event: dict) -> None:
 
         dispatch_id = uuid.uuid4().hex
         envelope = build_envelope(source_type, target_id, display_name,
-                                  message, event, dispatch_id)
+                                  message, event, dispatch_id,
+                                  person_id=person.get("personId"))
         dispatched_at_ms = int(time.time() * 1000)
         try:
             dsh_rpc("session.prompt", {
@@ -826,12 +1319,12 @@ def handle_event(state: dict, event: dict) -> None:
                 "content": [{"type": "text", "text": envelope}],
                 "clientTimeZone": CLIENT_TZ})
         except Exception as e:
-            log.error("session.prompt failed for message %s (session %s): %s — "
+            log.error("session.prompt failed for message %s (session %s): %s - "
                       "left UNMARKED (retryable on redelivery)",
                       message_id, sid, e.__class__.__name__)
             return
         if not mark_accepted(state, message_id):
-            log.critical("msg %s prompted but acceptance state NOT persisted — "
+            log.critical("msg %s prompted but acceptance state NOT persisted - "
                          "fail-closed engaged; reply delivery aborted for safety",
                          message_id)
             return
@@ -841,10 +1334,24 @@ def handle_event(state: dict, event: dict) -> None:
         reply = wait_for_reply(sid, dispatch_id, dispatched_at_ms)
         if not reply:
             log.error("no reply extracted for line msg %s (session %s, "
-                      "dispatch %s) — NOT retrying automatically",
+                      "dispatch %s) - NOT retrying automatically",
                       message_id, sid, dispatch_id)
             return
         deliver_reply(state, message_id, target_id, reply)
+
+
+def _capture_txn(adm, source_type, target_id, user_id, summary, captured):
+    """Candidate capture under the single-family-group invariant. No roster
+    for PENDING/DECLINED (minimal metadata only)."""
+    kind_state = group_state(adm, target_id) if target_id else "UNKNOWN"
+    if kind_state in ("PENDING", "APPROVED"):
+        captured["kind"] = "KNOWN"
+        adm, _ = observe_group_message(adm, source_type, target_id, None,
+                                       summary)  # summary refresh only
+        return adm, True
+    adm, ev = observe_group_message(adm, source_type, target_id, None, summary)
+    captured["kind"] = ev
+    return adm, True
 
 
 # --- signature verification -----------------------------------------------------
@@ -1014,7 +1521,7 @@ def main() -> None:
     WebhookHandler.executor = ThreadPoolExecutor(
         max_workers=4, thread_name_prefix="line-worker")
     server = http.server.ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), WebhookHandler)
-    log.info("dsh-line-inbound v1.2 listening on %s:%d%s",
+    log.info("dsh-line-inbound v1.3 (identity+admission) listening on %s:%d%s",
              LISTEN_HOST, LISTEN_PORT, WEBHOOK_PATH)
     import threading as _t
     accept_thread = _t.Thread(target=server.serve_forever, daemon=True)
@@ -1022,6 +1529,9 @@ def main() -> None:
     retry = _t.Thread(target=pending_retry_loop,
                       args=(WebhookHandler.state, _stop_event), daemon=True)
     retry.start()
+    maint = _t.Thread(target=admission_maintenance_loop,
+                      args=(_stop_event,), daemon=True)
+    maint.start()
     try:
         while not _stop_event.wait(1.0):
             pass
@@ -1082,9 +1592,11 @@ def main() -> None:
 
 def selftest() -> int:
     import tempfile
-    global STATE_DIR, STATE_PATH
+    global STATE_DIR, STATE_PATH, ADMISSION_PATH, ADMISSION_LOCK_PATH
     STATE_DIR = Path(tempfile.mkdtemp(prefix="dsh-line-selftest"))
     STATE_PATH = STATE_DIR / "line-state.json"
+    ADMISSION_PATH = STATE_DIR / "admission-state.json"
+    ADMISSION_LOCK_PATH = STATE_DIR / "admission.lock"
     failures = []
 
     def check(name: str, cond: bool):
@@ -1193,19 +1705,96 @@ def selftest() -> int:
                           {"source": {"type": "user", "userId": "U123"}}, "d2")
     check("envelope notes unsupported media", "media handling not enabled" in env2)
 
-    # 5. trust gate
+    # 5. admission + mention trust gate (Increment 1)
+    check("mention gate: isSelf dispatches", mention_gate_self([{"isSelf": True}]))
+    check("mention gate: @All alone NEVER dispatches",
+          not mention_gate_self([{"type": "all"}]))
+    check("mention gate: other-user mention does not dispatch",
+          not mention_gate_self([{"userId": "U9", "isSelf": False}]))
+    check("mention gate: malformed mentionees fail closed",
+          not mention_gate_self("x") and not mention_gate_self(None))
+
+    def adm_with(gid, state, roster=None):
+        a = json.loads(json.dumps(DEFAULT_ADMISSION))
+        a["groups"][gid] = {"state": state, "kind": "group", "summary": None,
+                            "firstSeen": admission_now(), "decidedAt": None,
+                            "decidedBy": None, "roster": list(roster or []),
+                            "leaveRequested": False, "left": False,
+                            "leaveAttempts": 0}
+        return a
+
     group_evt = {"mode": "active", "type": "message",
                  "source": {"type": "group", "groupId": "G1", "userId": "U1"},
                  "message": {"id": "m3", "type": "text", "text": "hi",
                              "mention": {"mentionees": [{"isSelf": True}]}}}
-    ok, tgt, stype = should_dispatch(group_evt)
-    check("group mention dispatch", ok and tgt == "G1" and stype == "group")
+    d = classify_event(group_evt, adm_with("G1", "APPROVED"))
+    check("approved group + isSelf -> dispatch (self_mentioned)",
+          d["action"] == "APPROVED_GROUP_MSG" and d["self_mentioned"] is True)
     group_evt2 = json.loads(json.dumps(group_evt))
-    group_evt2["message"]["mention"] = {"mentionees": [{"userId": "U9", "isSelf": False}]}
-    check("group without mention skipped", not should_dispatch(group_evt2)[0])
+    group_evt2["message"]["mention"] = {"mentionees": [{"type": "all"}]}
+    d2 = classify_event(group_evt2, adm_with("G1", "APPROVED"))
+    check("approved group @All -> no dispatch (self_mentioned False)",
+          d2["action"] == "APPROVED_GROUP_MSG" and d2["self_mentioned"] is False)
+    group_evt3 = json.loads(json.dumps(group_evt))
+    group_evt3["message"].pop("mention")
+    group_evt3["message"]["text"] = "@DSH please"   # textual lookalike only
+    d3 = classify_event(group_evt3, adm_with("G1", "APPROVED"))
+    check("approved group literal @DSH text -> no dispatch",
+          d3["action"] == "APPROVED_GROUP_MSG" and d3["self_mentioned"] is False)
+    check("unapproved group + valid own-mention -> still no dispatch",
+          classify_event(group_evt, adm_with("G1", "PENDING"))["action"]
+          == "OBSERVE_PENDING")
+    check("unknown group -> captured PENDING (never dispatched)",
+          classify_event(group_evt, json.loads(json.dumps(DEFAULT_ADMISSION)))["action"]
+          == "OBSERVE_PENDING")
+    dm_evt = {"mode": "active", "type": "message",
+              "source": {"type": "user", "userId": "U1"},
+              "message": {"id": "m4", "type": "text", "text": "hello"}}
+    a_dm = json.loads(json.dumps(DEFAULT_ADMISSION))
+    a_dm["groups"]["Gok"] = {"state": "APPROVED", "kind": "group",
+                             "summary": None, "firstSeen": admission_now(),
+                             "decidedAt": None, "decidedBy": None,
+                             "roster": ["U1"], "leaveRequested": False,
+                             "left": False, "leaveAttempts": 0}
+    check("family user (approved-group roster) DM dispatches without mention",
+          classify_event({"mode": "active", "type": "message",
+                          "source": {"type": "user", "userId": "U1"},
+                          "message": {"id": "m4", "type": "text", "text": "x"}},
+                         a_dm)["action"] == "DISPATCH_DM")
+    check("unknown outsider DM -> denied",
+          classify_event({"mode": "active", "type": "message",
+                          "source": {"type": "user", "userId": "Ustranger"},
+                          "message": {"id": "m5", "type": "text", "text": "hi"}},
+                         json.loads(json.dumps(DEFAULT_ADMISSION)))["action"]
+          == "DENIED_DM")
     standby_evt = {"mode": "standby", "type": "message", "source": {"type": "user",
                    "userId": "U1"}, "message": {"id": "m4", "type": "text", "text": "x"}}
-    check("standby mode skipped", not should_dispatch(standby_evt)[0])
+    check("standby mode skipped", classify_event(standby_evt, a_dm)["action"] == "SKIP")
+
+    # 5b. person identity semantics
+    a_p = json.loads(json.dumps(DEFAULT_ADMISSION))
+    p1 = new_person(a_p, "Test Person")
+    p1["bindings"]["line"].append("Uline")
+    check("person exists with LINE binding only", p1["bindings"]["discord"] == [])
+    p2 = new_person(a_p, "Same Display Name")
+    p2["bindings"]["line"].append("Uother")
+    check("same-label persons stay separate (no name inference)",
+          p1["personId"] != p2["personId"]
+          and len(a_p["persons"]) == 2)
+    p2["bindings"]["discord"].append("Ddisc")
+    check("explicit second-channel binding lands on same person",
+          len(p2["bindings"]["discord"]) == 1)
+    check("person_for_line resolves bound user",
+          person_for_line(a_p, "Uline")["personId"] == p1["personId"])
+    a_p["persons"][p1["personId"]]["bindings"]["line"].append("Uline")
+    check("duplicate binding corrupt -> fail-closed marker",
+          person_for_line(a_p, "Uline").get("__corrupt__") is True)
+
+    # 5c. malformed admission state -> deny-all
+    bad = {"version": 1, "persons": "nope", "groups": {}, "dmGrants": {"line": {}}}
+    check("malformed admission validation rejects", not _validate_admission(bad))
+    good = json.loads(json.dumps(DEFAULT_ADMISSION))
+    check("default admission validates", _validate_admission(good))
 
     # 6. group profile path
     check("group profile endpoint",
@@ -1289,6 +1878,29 @@ def selftest() -> int:
     e6 = loaded["pending"]["m6"]
     check("malformed pending normalized",
           e6["inFlight"] is False and e6["inFlightAt"] == 0 and e6["attempts"] == 0)
+
+    # 12. admission persistence + fail-closed load
+    a_save, ok1 = load_admission()
+    check("empty admission store loads healthy deny-all", ok1)
+    a_save = json.loads(json.dumps(DEFAULT_ADMISSION))
+    a_save["groups"]["Gx"] = {"state": "PENDING", "kind": "group",
+                              "summary": {"name": "Candidate"}, "firstSeen": admission_now(),
+                              "decidedAt": None, "decidedBy": None, "roster": [],
+                              "leaveRequested": False, "left": False,
+                              "leaveAttempts": 0}
+    check("save_admission persists", save_admission(a_save))
+    a_back, ok2 = load_admission()
+    check("admission round-trip",
+          ok2 and group_state(a_back, "Gx") == "PENDING")
+    ADMISSION_PATH.write_text("{ malformed ")
+    _, ok3 = load_admission()
+    check("malformed admission file -> unhealthy deny-all", not ok3)
+    ADMISSION_PATH.unlink()
+    a4, ok4 = load_admission()
+    a4, k4 = observe_group_message(a4, "group", "Gnew", "U9",
+                                   {"name": "Candidate Group"})
+    check("unknown group observation -> NEW_PENDING",
+          k4 == "NEW_PENDING" and group_state(a4, "Gnew") == "PENDING")
 
     print(f"  result: {'ALL PASS' if not failures else f'FAILURES: {failures}'}")
     return 0 if not failures else 1

@@ -21,7 +21,7 @@ whitespace-only final suppressed (F3). Exit 0 = all pass.
 Passing no argument targets the default installed location
 `/opt/dsh-line/dsh_line_inbound.py`.
 
-## LINE listener selftest (40 checks)
+## LINE listener selftest (66 checks)
 
 ```bash
 python3 localclaw/integrations/line/dsh_line_inbound.py --selftest
