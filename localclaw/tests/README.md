@@ -2,6 +2,25 @@
 
 No test framework is required — the shipped selftests are self-contained.
 
+## F3 final-output filtering regression battery (11 checks)
+
+```bash
+python3 localclaw/tests/test_f3_final_output.py localclaw/integrations/line/dsh_line_inbound.py
+```
+
+This is the dedicated F3 qualification suite used for deployment qualification
+(11/11 PASS against the captured `dsh_line_inbound.py`). It loads the adapter
+module read-only (credentials load lazily; state directory is overridden to a
+temp dir) and runs `extract_reply_for_dispatch()` against a replica of the
+observed multi-step turn shape, including the RED final tool-call-block
+suppression case, GREEN extraction cases (ordinary, multi-part, media-bearing),
+fail-closed cases (tool-only turn end, unfinished turn, duplicate dispatch
+marker, whitespace-only final), and the three review coverage findings:
+last-assistant-before-turn/end wins (F1), malformed blocks ignored (F2),
+whitespace-only final suppressed (F3). Exit 0 = all pass.
+Passing no argument targets the default installed location
+`/opt/dsh-line/dsh_line_inbound.py`.
+
 ## LINE listener selftest (40 checks)
 
 ```bash
