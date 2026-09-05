@@ -51,3 +51,19 @@ failure. Deterministic, stdlib-only — no LLM judgment.
 The gate's public-destination guard is exercised in-process by
 `integrations/webgate/webgate_guard.py` (fail-closed denylist classification);
 deployment verification steps are documented in the webgate unit file comments.
+
+## Translation command suite (Increment 2, 47 checks)
+
+```bash
+python3 localclaw/tests/test_translate_command.py localclaw/integrations/line/dsh_line_inbound.py
+```
+
+Covers the explicit `translate <text>` command end to end on synthetic IDs:
+group/DM selection, mention-metadata gating, verbatim specialist pass-through
+in BOTH final shapes the specialist can produce (the raw MCP envelope and the
+plain translation text - the latter is what production emits), fail-closed
+rejection of error-shaped/echoed/invalid-envelope output, redelivery dedupe,
+eligibility revalidation, reply-invoked translate, and the outbound-author
+(conv-key) canonicalization legs added after live acceptance.
+
+Run both suites (plus the adapter's `--selftest`) before any deployment.

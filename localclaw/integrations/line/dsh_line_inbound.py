@@ -45,6 +45,30 @@ session/model/tool work; unknown groups are captured as PENDING candidates
 expires), unadmitted DM outsiders are denied, and group dispatch requires
 LINE's own-mention metadata (isSelf==True) — @All and textual lookalikes
 never summon DSH. F3 final-output filtering unchanged.
+
+v5 (Increment 2, 2026-09-04): explicit EN<->TH translation command. Command form:
+`translate <text>` in an admitted DM; `@DSH translate <text>` (real LINE
+own-mention metadata) in the approved group; source text supplied in the SAME
+message; nothing inferred from prior messages. Gating unchanged: the command is
+recognized ONLY after the Increment-1 admission+own-mention trust gate passes, so
+literal '@DSH' text and '@All' never reach translation. Dispatch goes to the
+DSH-native Typhoon translation specialist (cordis subagent `translate`); the
+specialist's reply is returned translation-only. Specialist failure returns a
+concise fixed user-facing failure line — NEVER a fabricated/fallback normal-model
+answer — under the unchanged F3 final-output filter.
+
+v6 (Increment 2b, 2026-09-04): reply-to-DSH invocation. In the APPROVED family
+group a LINE Reply (quotedMessageId) that POSITIVELY refers to a message DSH
+itself sent now invokes DSH, same as a real own-mention. Authorship proof is
+metadata-only: our own Push API `sentMessages[].id` responses are recorded
+(bounded, prunable, no message bodies) and matched against the inbound
+quotedMessageId within the same conversation. Replies to family members,
+unknown/stale ids, other conversations, unapproved groups, '@All' and literal
+typed '@DSH' never invoke. When the Push response exposes no sent-message ids
+(legacy/empty body) the feature fail-opens to mention-only — never heuristic
+author detection (no display text, names, timestamps, or model inference).
+Translation composes with either invocation form: invoked DSH + text starting
+with `translate ` = translation.
 """
 
 from __future__ import annotations
@@ -57,6 +81,8 @@ import http.server
 import json
 import logging
 import os
+import queue
+import re
 import signal
 import sys
 import threading
@@ -74,6 +100,13 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 3087
 WEBHOOK_PATH = "/line/webhook"
 HEALTH_PATH = "/line/health"
+# Increment 2: only text messages carry the translation command; every other
+# message type goes down the normal envelope path (media not enabled yet).
+TRANSLATE_TARGET_TYPES = frozenset({"text"})
+# Increment 2b: bounded authorship memory for reply-to-DSH recognition.
+# sent-message IDs of our own replies, mapped to the conversation — NO bodies.
+DSH_OUTBOUND_MAX = 500              # max tracked sent-message IDs
+                                    # (oldest-first eviction; NO time TTL)
 
 LINE_API = "https://api.line.me/v2/bot"
 DSH_API = "http://127.0.0.1:3080/api/"
@@ -169,6 +202,16 @@ def load_state() -> dict:
             state.setdefault("failed", [])
             state.setdefault("pending", {})
             state.setdefault("profiles", {})
+            state.setdefault("dshOutbound", {})
+            # Increment 2b: normalize outbound-author memory (bounded
+            # metadata; malformed/foreign entries dropped at load).
+            ob = state.get("dshOutbound", {})
+            for sid, e in list(ob.items()):
+                if not isinstance(e, dict) \
+                        or not isinstance(sid, str) or not sid \
+                        or not isinstance(e.get("conv"), str) \
+                        or not isinstance(e.get("at"), (int, float)):
+                    ob.pop(sid, None)
             # schema-normalize pending entries (malformed claim fields would
             # otherwise strand a claim: treated as not-in-flight, re-durable)
             for mid, e in list(state.get("pending", {}).items()):
@@ -185,7 +228,7 @@ def load_state() -> dict:
     except Exception:
         pass
     return {"sessions": {}, "accepted": [], "delivered": [], "failed": [],
-            "pending": {}, "profiles": {}}
+            "pending": {}, "profiles": {}, "dshOutbound": {}}
 
 
 def save_state(state: dict) -> bool:
@@ -1026,6 +1069,240 @@ def wait_for_reply(session_id: str, dispatch_id: str,
     return None
 
 
+# --- translation (Increment 2) --------------------------------------------------
+# Explicit EN<->TH translation command. The DSH-native Typhoon translation
+# specialist (cordis subagent, toolName `translate`) owns direction detection,
+# translation, and name/URL/number preservation; the adapter only parses the
+# command and carries the payload. Nothing here selects or detects language.
+TRANSLATE_CMD = "translate"
+TRANSLATE_CMD_MAX = 4000                    # bounded source text (chars)
+TRANSLATE_FAILURE_TEXT = ("Sorry — the translation service is unavailable "
+                          "right now. Please try again in a moment.")
+TRANSLATE_HELP_TEXT = ("Please send the text to translate in the same "
+                       "message, e.g. `translate Good morning`.")
+TRANSLATE_PERSONA = (
+    "You are a translation engine. Translate the user's text automatically "
+    "between English and Thai: predominantly English source -> natural Thai; "
+    "predominantly Thai source -> natural English. For mixed text, translate "
+    "the natural-language content and keep embedded names, URLs, numbers, "
+    "emojis and formatting unchanged where practical. Output ONLY the "
+    "translation — no preamble, no commentary, no alternatives, no "
+    "transliteration, no explanation.")
+
+
+def parse_translate_command(text: str) -> dict | None:
+    """Smallest unambiguous parser for the explicit translation command:
+    `translate <text>` must be the START of the text it is given.
+
+    Callers contract: the DM path passes the RAW message text; the group path
+    passes the own-mention-stripped remainder (strip_own_mention_text — the
+    real mention span was already removed and the gate already passed). The
+    parser itself performs no gating and no mention handling.
+
+    Returns {"source": <text>} or None. Bare `translate` (empty source) is a
+    VALID command match returning {"source": ""} — the caller renders a
+    concise failure/help instead of invoking the specialist. Non-command text
+    (including the word `translate` anywhere but the command position) -> None.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    s = text.lstrip()
+    m = re.match(r"translate(?:\s+(.*))?$", s, re.DOTALL | re.IGNORECASE)
+    if not m:
+        return None
+    source = (m.group(1) or "").strip()
+    if len(source) > TRANSLATE_CMD_MAX:
+        return None
+    return {"source": source}
+
+
+def translate_output_valid(reply: str, source: str) -> bool:
+    """Fail-closed validity gate on the specialist's output. Probes proved
+    the child chain can occasionally return a source ECHO or an error string
+    instead of a translation; such output must NEVER reach the family. This
+    is rejection (-> concise failure line), not post-generation editing of
+    accepted translations."""
+    if not isinstance(reply, str) or not reply.strip():
+        return False
+    r = reply.strip()
+    if r.startswith("Error:") or r.startswith("error:"):
+        return False
+    s = (source or "").strip()
+    if len(s) > 8 and r.casefold() == s.casefold():
+        return False  # source echoed untranslated
+    return True
+
+
+def translate_via_dsh(session_id: str, dispatch_id: str,
+                      source: str) -> str | None:
+    """Send ONLY the source text to the DSH-native translation specialist
+    (cordis subagent `translate`, model switchyard/thaillm/typhoon) through
+    the SAME session.prompt -> history-extraction path as normal dispatches
+    (F3 final-output filtering unchanged). Returns the specialist's reply, or
+    None on any failure — callers must NEVER substitute a normal-model answer
+    for a failed translation (fail-closed user-facing failure line instead)."""
+    marker = f"[line translate {dispatch_id}]"
+    envelope = (f"{marker}\n"
+                "Use the translate tool ONCE with source_text set to EXACTLY "
+                "the text between BEGIN and END below (copy it verbatim, no "
+                "edits, no additions):\n"
+                "BEGIN\n"
+                f"{source}\n"
+                "END\n"
+                "After the tool returns, reply with the translation from the "
+                "tool result and nothing else.")
+    dispatched_at_ms = int(time.time() * 1000)
+    try:
+        dsh_rpc("session.prompt", {
+            "sessionId": session_id, "mode": "queue",
+            "content": [{"type": "text", "text": envelope}],
+            "clientTimeZone": CLIENT_TZ})
+    except Exception as e:
+        log.error("translation session.prompt failed (session %s, dispatch %s): %s",
+                  session_id, dispatch_id, e.__class__.__name__)
+        return None
+    reply = wait_for_reply(session_id, dispatch_id, dispatched_at_ms)
+    if reply is None or not reply.strip():
+        log.error("translation produced no reply (session %s, dispatch %s)",
+                  session_id, dispatch_id)
+        return None
+    # The specialist's FINAL assistant text may arrive in two shapes:
+    #   (a) the raw MCP tool-result envelope {"ok": true,
+    #       "result": {"translation": "..."}} — a model that quotes the
+    #       tool result verbatim, and
+    #   (b) the translation itself, because the model followed the envelope
+    #       instruction and replied with the translation text (observed live
+    #       in production 2026-09-05 16:19-16:20 BKK).
+    # Accept BOTH. A JSON object that is not a VALID ok:true envelope (or
+    # relays ok:false) is a failure — never deliver a wrapped/partial
+    # payload. Non-object text IS the translation; downstream gates
+    # (error-shape, source-echo, failure-text) still apply fail-closed.
+    r = reply.strip()
+    if r.startswith("error:"):
+        log.error("translate tool failed (dispatch %s): %.120s",
+                  dispatch_id, r)
+        return None
+    translation: str | None = None
+    if r.startswith("{"):
+        try:
+            parsed = json.loads(r)
+        except json.JSONDecodeError:
+            log.error("translate tool returned malformed envelope "
+                      "(dispatch %s): %.120s", dispatch_id, r)
+            return None
+        if isinstance(parsed, dict):
+            if parsed.get("ok") is True and isinstance(parsed.get("result"), dict):
+                t = parsed["result"].get("translation")
+                if isinstance(t, str) and t.strip():
+                    translation = t
+            else:
+                log.error("translate tool returned invalid/failed envelope "
+                          "(dispatch %s): %.120s", dispatch_id, r)
+                return None
+        else:
+            translation = r  # JSON but not an object — treat as text
+    else:
+        translation = r  # plain final text = the translation itself
+    if translation is None or not translation.strip():
+        log.error("translate produced empty translation (dispatch %s)",
+                  dispatch_id)
+        return None
+    if not translate_output_valid(translation, source):
+        log.error("translate output invalid (echo shape) - treating as "
+                  "failure (dispatch %s)", dispatch_id)
+        return None
+    return translation
+
+
+# Increment 2b: outbound DSH-authorship memory (bounded metadata, no bodies).
+
+def outbound_conv_key(target_id: str) -> str:
+    """Canonical conversation key for the outbound-author store. Targets in
+    this adapter appear both raw (LINE Push API 'to': U…/C…/R…, LINE's
+    stable ID/type convention) and prefixed (internal keys: user:/group:/
+    room:). Store and lookup MUST agree or reply-to-DSH can never match
+    (INC2 live-acceptance finding 2026-09-05 18:00: capture stored raw,
+    gate compared prefixed). Idempotent."""
+    if not isinstance(target_id, str) or not target_id:
+        return str(target_id)
+    if target_id.startswith(("user:", "group:", "room:")):
+        return target_id
+    if target_id.startswith("U"):
+        return f"user:{target_id}"
+    if target_id.startswith("R"):
+        return f"room:{target_id}"
+    return f"group:{target_id}"
+
+
+def record_outbound_ids(state: dict, target_id: str,
+                        sent_ids: list) -> bool:
+    """Record the sent-message IDs of OUR OWN push (authorship proof for
+    reply-to-DSH). Minimum bounded metadata only: id -> (conversation key,
+    epoch timestamp). NO message bodies, NO user content. Retention is a
+    bounded OLDEST-FIRST store (DSH_OUTBOUND_MAX) - NO time-based TTL: a
+    valid LINE Reply must never stop invoking DSH merely because the quoted
+    message aged out (operator directive 2026-09-05); no LINE semantics
+    require one. Persistence failure FAILS CLOSED (STATE_UNAVAILABLE): reply
+    recognition becomes unavailable and dispatch is refused rather than
+    running on unverifiable authorship memory. The real-self-mention path is
+    metadata-only and unaffected."""
+    with STATE_LOCK:
+        ob = state.setdefault("dshOutbound", {})
+        now = time.time()
+        for sid in sent_ids:
+            if isinstance(sid, str) and sid:
+                ob[sid] = {"conv": outbound_conv_key(target_id), "at": now}
+        # bounded oldest-first eviction (no TTL expiry)
+        if len(ob) > DSH_OUTBOUND_MAX:
+            for sid, _ in sorted(ob.items(),
+                                 key=lambda kv: kv[1].get("at", 0))[
+                                 :len(ob) - DSH_OUTBOUND_MAX]:
+                ob.pop(sid, None)
+        if not save_state(state):
+            STATE_UNAVAILABLE.set()
+            log.critical("outbound-author memory NOT persisted - reply-to-DSH "
+                         "recognition fails closed (fail-closed)")
+            return False
+        return True
+
+
+def dsh_sent_message_id(state: dict, quoted_id: str, conv_key: str) -> bool:
+    """TRUE iff quoted_id refers to a message THIS adapter sent into the SAME
+    conversation (metadata-only authorship proof). Unknown/stale/other-
+    conversation ids -> False (reply stays silent). Both sides are passed
+    through the canonical key form (INC2 live-acceptance fix 2026-09-05:
+    capture previously stored raw ids while the gate compared prefixed
+    keys — same-conversation match was structurally impossible; canonicaliz-
+    ing the STORED side too rescues any raw entries written before v1.4.2)."""
+    entry = state.get("dshOutbound", {}).get(str(quoted_id))
+    if not isinstance(entry, dict):
+        return False
+    return outbound_conv_key(entry.get("conv", "")) == outbound_conv_key(conv_key)
+
+
+def prune_outbound(state: dict) -> None:
+    """Periodic retention bound for the outbound-author memory (main loop):
+    bounded oldest-first only - no time-based expiry. Malformed entries are
+    dropped as unmatchable metadata corruption."""
+    with STATE_LOCK:
+        ob = state.get("dshOutbound")
+        if not ob:
+            return
+        changed = False
+        for sid, e in list(ob.items()):
+            if not isinstance(e, dict):
+                ob.pop(sid, None)
+                changed = True
+        if len(ob) > DSH_OUTBOUND_MAX:
+            for sid, _ in sorted(ob.items(),
+                                 key=lambda kv: kv[1].get("at", 0))[
+                                 :len(ob) - DSH_OUTBOUND_MAX]:
+                ob.pop(sid, None)
+                changed = True
+        if changed:
+            save_state(state)
+
+
 # --- delivery -------------------------------------------------------------------
 
 
@@ -1049,10 +1326,21 @@ def chunk_reply_text(reply: str) -> list[str]:
     return out
 
 
-def _push_claimed(claim: dict, message_id: str) -> None:
-    """Perform the push for a claimed delivery. Raises on failure."""
-    push_messages(claim["to"], chunk_reply_text(claim["reply"]),
-                  retry_key_seed=message_id)
+def _push_claimed(state: dict, claim: dict, message_id: str) -> None:
+    """Perform the push for a claimed delivery. Raises on failure. Captures
+    the sent-message IDs from the Push response (sentMessages[].id) into the
+    bounded outbound-author memory (reply-to-DSH proof; no bodies)."""
+    resp = push_messages(claim["to"], chunk_reply_text(claim["reply"]),
+                         retry_key_seed=message_id)
+    sent = None
+    if isinstance(resp, dict):
+        sent = resp.get("sentMessages")
+    if isinstance(sent, list) and sent:
+        ids = [m.get("id") for m in sent if isinstance(m, dict)]
+        log.info("push captured %d outbound id(s) for %s",
+                 len([i for i in ids if i]), outbound_conv_key(claim["to"]))
+        if not record_outbound_ids(state, claim["to"], [i for i in ids if i]):
+            raise CredError("outbound-author memory not persisted")
 
 
 def deliver_reply(state: dict, message_id: str, target_id: str, reply: str) -> bool:
@@ -1067,7 +1355,7 @@ def deliver_reply(state: dict, message_id: str, target_id: str, reply: str) -> b
     if not claim:
         return False
     try:
-        _push_claimed(claim, message_id)
+        _push_claimed(state, claim, message_id)
     except (LineHttpError, CredError) as e:
         log.error("push failed for msg %s: %s (queued for bounded retry)",
                   message_id, e)
@@ -1122,7 +1410,7 @@ def pending_retry_loop(state: dict, stop_event: threading.Event) -> None:
             if not claim:
                 continue
             try:
-                _push_claimed(claim, message_id)
+                _push_claimed(state, claim, message_id)
             except (LineHttpError, CredError) as e:
                 log.warning("pending retry failed for msg %s: %s", message_id, e)
                 if not finish_delivery(state, message_id, success=False):
@@ -1204,16 +1492,61 @@ def handle_event(state: dict, event: dict) -> None:
             log.critical("approved-group roster transaction failed/unhealthy "
                          "- message %s not rostered (fail-closed)", message_id)
             return
-        if not decision.get("self_mentioned"):
-            log.info("admission gate: approved-group chatter rostered sender "
-                     "%s; no DSH own-mention - silent (never dispatched)",
+        conv_key = f"{source_type}:{target_id}"
+        own_mentioned = bool(decision.get("self_mentioned"))
+        # Increment 2b: second invocation form — a LINE Reply whose
+        # quotedMessageId POSITIVELY refers to a message this adapter sent
+        # into THIS conversation (bounded metadata memory, no bodies).
+        # Operator correction (2026-09-05): the two signals are INDEPENDENT —
+        # unrelated mention metadata (@All, other-member mentions) never
+        # cancels a positively authenticated reply-to-DSH invocation.
+        quoted = message.get("quotedMessageId")
+        reply_invoked = bool(quoted) and dsh_sent_message_id(state, quoted,
+                                                             conv_key)
+        if reply_invoked:
+            log.info("admission gate: approved-group reply-to-DSH dispatch "
+                     "(sender %s rostered, quoted confirmed DSH outbound)",
                      user_id)
+        elif own_mentioned:
+            log.info("admission gate: approved-group own-mention dispatch "
+                     "(sender %s rostered)", user_id)
+        else:
+            if quoted:
+                log.info("admission gate: reply-to-DSH not invoked - "
+                         "quotedMessageId %.8s not confirmed as DSH "
+                         "outbound for %s", str(quoted), conv_key)
+            log.info("admission gate: approved-group chatter rostered sender "
+                     "%s; no own-mention/reply-to-DSH - silent (never "
+                     "dispatched)", user_id)
             return
-        log.info("admission gate: approved-group own-mention dispatch "
-                 "(sender %s rostered)", user_id)
+        # Increment 2: `translate <text>` in the SAME message as a DSH
+        # invocation. Own-mention messages parse from the mention-stripped
+        # remainder; reply-invoked messages parse from raw text (a literal
+        # '@DSH' there is just text and will not parse — no string detection).
+        if message.get("type") in TRANSLATE_TARGET_TYPES:
+            stripped = strip_own_mention_text(message) if own_mentioned \
+                else (message.get("text") or "")
+            cmd = parse_translate_command(stripped)
+            if cmd is not None:
+                log.info("translation command in approved group "
+                         "(sender %s, source_chars=%d)",
+                         user_id, len(cmd["source"]))
+                return handle_translate(state, message_id, target_id, user_id,
+                                        source_type, cmd, event)
     elif action == "DISPATCH_DM":
         target_id = decision["target_id"]
         source_type = decision["source_type"]
+        # Increment 2: admitted DMs need no mention; `translate <text>` must be
+        # the START of the message. Non-command DMs stay on the normal path.
+        if message.get("type") in TRANSLATE_TARGET_TYPES:
+            cmd = parse_translate_command(message.get("text") or "")
+            if cmd is not None:
+                log.info("translation command in admitted DM "
+                         "(sender %s, source_chars=%d)",
+                         decision["user_id"], len(cmd["source"]))
+                return handle_translate(state, message_id, target_id,
+                                        decision["user_id"], source_type,
+                                        cmd, event)
     else:
         # OBSERVE_PENDING (candidate capture / metadata refresh),
         # DENIED_DM, DENIED_GROUP, SKIP, SKIP_SILENT, standby, non-message.
@@ -1337,6 +1670,136 @@ def handle_event(state: dict, event: dict) -> None:
                       "dispatch %s) - NOT retrying automatically",
                       message_id, sid, dispatch_id)
             return
+        deliver_reply(state, message_id, target_id, reply)
+
+
+def strip_own_mention_text(message: dict) -> str:
+    """Remove ONLY the real own-mention span from the group text, using LINE's
+    own mention metadata (index/range when present; the DSH-surface prefix
+    fallback when LINE omits indices). Never consults the raw text to DETECT a
+    mention (that stays `mention_gate_self`'s metadata-only job) — the span is
+    stripped only after the gate has already passed."""
+    text = message.get("text") or ""
+    mentionees = ((message.get("mention") or {}).get("mentionees")) or []
+    own = next((m for m in mentionees if isinstance(m, dict)
+                and m.get("isSelf") is True), None)
+    if own is None:
+        return text
+    idx, length = own.get("index"), own.get("length")
+    if isinstance(idx, int) and isinstance(length, int) \
+            and 0 <= idx and idx + length <= len(text):
+        return (text[:idx] + text[idx + length:]).lstrip()
+    # metadata present but no usable span: drop a leading @<surface> prefix
+    return re.sub(r"^@\S+\s*", "", text).lstrip()
+
+
+def handle_translate(state: dict, message_id: str, target_id: str,
+                     user_id: str, source_type: str, cmd: dict,
+                     event: dict) -> None:
+    """Increment 2 translation dispatch. Runs strictly AFTER the Increment-1
+    trust gate; same dedupe / eligibility-revalidation / person-binding
+    protocol as normal dispatch. Empty source -> concise help, no specialist
+    call. Specialist failure -> concise fixed failure line (NEVER a
+    normal-model answer). F3 final-output filtering unchanged."""
+    source = cmd.get("source") or ""
+    if not source:
+        with conversation_lock(f"{source_type}:{target_id}"):
+            with STATE_LOCK:
+                if message_id in state.get("delivered", []):
+                    return
+                if message_id in state.get("accepted", []):
+                    pending = has_pending(state, message_id)
+                    if pending and not pending.get("inFlight"):
+                        log.info("translate redelivery: recovering help "
+                                 "reply for %s (no re-dispatch)", message_id)
+                        deliver_reply(state, message_id, target_id,
+                                      pending["reply"])
+                        return
+                    log.info("translate dedupe skip (accepted): message %s",
+                             message_id)
+                    return
+                if not mark_accepted(state, message_id):
+                    return  # fail-closed (persistence failure already logged)
+            ok = deliver_reply(state, message_id, target_id,
+                               TRANSLATE_HELP_TEXT)
+            if not ok:
+                log.error("translate help push failed for msg %s (queued "
+                          "for bounded retry)", message_id)
+        return
+    conv_key = f"{source_type}:{target_id}"
+    with conversation_lock(conv_key):
+        with STATE_LOCK:
+            if message_id in state.get("delivered", []):
+                return
+            if message_id in state.get("accepted", []):
+                # Hermes finding 1/2 fix: accepted-but-undelivered translate
+                # reply (restart/redelivery window) recovers the DURABLE
+                # pending reply — never a second specialist prompt.
+                pending = has_pending(state, message_id)
+                if pending and not pending.get("inFlight"):
+                    log.info("translate redelivery: recovering undelivered "
+                             "translation for %s (no re-prompt)", message_id)
+                    deliver_reply(state, message_id, target_id,
+                                  pending["reply"])
+                    return
+                log.info("translate dedupe skip (accepted): message %s",
+                         message_id)
+                return
+
+        dispatch_id = uuid.uuid4().hex
+
+        # admission revalidation + person binding in ONE transaction (same
+        # protocol as normal dispatch): re-checked against FINAL admission
+        # state under the exclusive lock immediately BEFORE any specialist
+        # session/model work.
+        def _translate_txn(adm):
+            if source_type == "group" and group_state(adm, target_id) != "APPROVED":
+                return adm, False
+            if source_type == "user" and not line_user_dm_eligible(adm, user_id):
+                log.critical("translate: DM eligibility withdrawn before "
+                             "dispatch - message %s aborted (fail-closed)",
+                             message_id)
+                return adm, False
+            p = person_for_line(adm, user_id)
+            if p and p.get("__corrupt__"):
+                log.critical("translate: person binding corrupt - message %s "
+                             "NOT dispatched (fail-closed)", message_id)
+                return adm, False
+            if p is None:
+                np_ = new_person(adm, None)
+                np_["bindings"]["line"].append(user_id)
+                np_["dmEligible"]["line"] = True
+                np_["updatedAt"] = admission_now()
+                p = np_
+            return adm, p
+
+        adm_final, person, persisted = transact_admission(_translate_txn)
+        if adm_final is None or not persisted or not person:
+            log.critical("translate: admission transaction failed/unhealthy - "
+                         "message %s aborted (fail-closed)", message_id)
+            return
+
+        sid = get_or_create_session(state, conv_key)
+        if not sid:
+            log.error("translate: no DSH session for %s; message %s UNMARKED",
+                      conv_key, message_id)
+            return
+
+        reply = translate_via_dsh(sid, dispatch_id, source)
+        if reply is None:
+            log.error("translation failed for line msg %s (session %s) - "
+                      "concise failure via the SAME durable delivery path, "
+                      "no model fallback", message_id, sid)
+            reply = TRANSLATE_FAILURE_TEXT
+        with STATE_LOCK:
+            if not mark_accepted(state, message_id):
+                return  # prompted but acceptance not durable -> fail-closed
+        # Hermes round-1 findings 1-4 fix: NO bespoke marker. The translate
+        # path resolves through the EXACT normal-delivery machinery —
+        # durable pending record, claim/finish reservation, X-Line-Retry-Key
+        # idempotent push, bounded background retry — so redelivery can never
+        # re-prompt the specialist (accepted dedupe) and a failed push is
+        # recovered durably exactly like any normal reply.
         deliver_reply(state, message_id, target_id, reply)
 
 
@@ -1521,7 +1984,8 @@ def main() -> None:
     WebhookHandler.executor = ThreadPoolExecutor(
         max_workers=4, thread_name_prefix="line-worker")
     server = http.server.ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), WebhookHandler)
-    log.info("dsh-line-inbound v1.3 (identity+admission) listening on %s:%d%s",
+    log.info("dsh-line-inbound v1.4.2 (identity+admission+translate+reply) "
+             "listening on %s:%d%s",
              LISTEN_HOST, LISTEN_PORT, WEBHOOK_PATH)
     import threading as _t
     accept_thread = _t.Thread(target=server.serve_forever, daemon=True)
@@ -1532,6 +1996,14 @@ def main() -> None:
     maint = _t.Thread(target=admission_maintenance_loop,
                       args=(_stop_event,), daemon=True)
     maint.start()
+
+    def _prune_loop():
+        while not _stop_event.wait(3600.0):
+            try:
+                prune_outbound(WebhookHandler.state)
+            except Exception as exc:
+                log.error("outbound prune error: %s", exc.__class__.__name__)
+    _t.Thread(target=_prune_loop, daemon=True).start()
     try:
         while not _stop_event.wait(1.0):
             pass
@@ -1901,6 +2373,127 @@ def selftest() -> int:
                                    {"name": "Candidate Group"})
     check("unknown group observation -> NEW_PENDING",
           k4 == "NEW_PENDING" and group_state(a4, "Gnew") == "PENDING")
+
+    # 13. Increment 2: translation command parser + mention-span strip
+    check("translate: group-mode parser on stripped remainder",
+          parse_translate_command("translate hello") == {"source": "hello"})
+    check("translate: chat containing 'translate' NOT a command (group)",
+          parse_translate_command("let's translate hello") is None)
+    check("translate: bare 'translate' -> empty-source command",
+          parse_translate_command("translate") == {"source": ""})
+    check("translate: DM '@DSH translate hello' NOT silently stripped",
+          parse_translate_command("@DSH translate hello") is None)
+    check("translate: DM non-command containing the word -> None",
+          parse_translate_command("how do I translate hello?") is None)
+    check("translate: case-insensitive + margin whitespace",
+          parse_translate_command("Translate  hello ") == {"source": "hello"})
+    check("translate: multiline source preserved",
+          parse_translate_command("translate line1\nline2") == {"source": "line1\nline2"})
+    check("translate: whitespace-only source -> empty-source command",
+          parse_translate_command("translate    ") == {"source": ""})
+    check("translate: oversized source rejected",
+          parse_translate_command("translate " + "x" * (TRANSLATE_CMD_MAX + 1)) is None)
+    check("translate: max-boundary source accepted",
+          parse_translate_command("translate " + "x" * TRANSLATE_CMD_MAX) is not None)
+    check("translate: non-string input -> None",
+          parse_translate_command(None) is None)
+    check("translate: 'translates hello' NOT a command (word boundary)",
+          parse_translate_command("translates hello") is None)
+    check("translate: 'translator hello' NOT a command",
+          parse_translate_command("translator hello") is None)
+    check("translate: strip helper uses mention index/length",
+          strip_own_mention_text({"text": "@DSH translate hi",
+                                  "mention": {"mentionees": [
+                                      {"isSelf": True, "index": 0, "length": 4}]}})
+          == "translate hi")
+    check("translate: strip helper prefix fallback (no indices)",
+          strip_own_mention_text({"text": "@DSH translate hi",
+                                  "mention": {"mentionees": [{"isSelf": True}]}})
+          == "translate hi")
+    check("translate: strip helper keeps OTHER-user mention span",
+          strip_own_mention_text({"text": "@Alice translate hi",
+                                  "mention": {"mentionees": [
+                                      {"userId": "Ux", "isSelf": False,
+                                       "index": 0, "length": 6}]}})
+          == "@Alice translate hi")
+
+    # 14. Increment 2b: outbound-authorship memory + reply-to-DSH gate
+    st = load_state()
+    check("outbound: record returns True on healthy persistence",
+          record_outbound_ids(st, "group:Gx", ["M-dsh-1", "M-dsh-2"]) is True)
+    check("outbound: sent ids recorded per conversation",
+          dsh_sent_message_id(st, "M-dsh-1", "group:Gx")
+          and dsh_sent_message_id(st, "M-dsh-2", "group:Gx"))
+    check("outbound: unknown quoted id -> False",
+          not dsh_sent_message_id(st, "M-unknown", "group:Gx"))
+    check("outbound: other-conversation id -> False",
+          not dsh_sent_message_id(st, "M-dsh-1", "group:Gother"))
+    check("outbound: malformed entry ignored",
+          not dsh_sent_message_id(st, "junk", "group:Gx"))
+    # conv-key canonicalization (INC2 v1.4.2): raw Push targets and prefixed
+    # internal keys must map to ONE canonical form, all LINE id kinds.
+    check("convkey: raw U id -> user: form",
+          outbound_conv_key("U123abc") == "user:U123abc")
+    check("convkey: raw C id -> group: form",
+          outbound_conv_key("C456def") == "group:C456def")
+    check("convkey: raw R id -> room: form",
+          outbound_conv_key("R789ghi") == "room:R789ghi")
+    check("convkey: prefixed user: unchanged (idempotent)",
+          outbound_conv_key("user:U123abc") == "user:U123abc")
+    check("convkey: prefixed group: unchanged (idempotent)",
+          outbound_conv_key("group:C456def") == "group:C456def")
+    check("convkey: prefixed room: unchanged (idempotent)",
+          outbound_conv_key("room:R789ghi") == "room:R789ghi")
+    st_raw = {"dshOutbound": {"M-x": {"conv": "C456def", "at": 0.0}}}
+    check("convkey: legacy raw stored entry matches prefixed lookup (rescue)",
+          dsh_sent_message_id(st_raw, "M-x", "group:C456def"))
+    st_amb = {"dshOutbound": {"M-y": {"conv": "group:U999zzz", "at": 0.0}}}
+    check("convkey: prefixed group key never matches a user conversation",
+          not dsh_sent_message_id(st_amb, "M-y", "user:U999zzz"))
+    # deterministic empty-store baseline for retention tests
+    st["dshOutbound"] = {}
+    st["dshOutbound"]["M-keep"] = {"conv": "group:Gx", "at": time.time()}
+    prune_outbound(st)
+    check("outbound: prune keeps valid entries (in-memory)",
+          "M-keep" in st["dshOutbound"])
+    # ancient entry KEPT: retention is bounded count only (no time TTL)
+    st["dshOutbound"]["M-ancient"] = {"conv": "group:Gx",
+                                      "at": time.time() - 90 * 86400}
+    prune_outbound(st)
+    check("outbound: ancient entry KEPT (no time-based TTL)",
+          "M-ancient" in st["dshOutbound"])
+    # persistence: explicit save then reload (prune saves only on change)
+    save_state(st)
+    check("outbound: retained entries persist to disk",
+          "M-keep" in load_state()["dshOutbound"]
+          and "M-ancient" in load_state()["dshOutbound"])
+    # bounded oldest-first eviction when full
+    st["dshOutbound"] = {f"M{i}": {"conv": "group:Gx", "at": 1000 + i}
+                         for i in range(DSH_OUTBOUND_MAX)}
+    st["dshOutbound"]["M-oldest"] = {"conv": "group:Gx", "at": 1}
+    st["dshOutbound"]["M-newest"] = {"conv": "group:Gx", "at": 9e9}
+    record_outbound_ids(st, "group:Gx", ["M-trigger"])
+    ob = load_state()["dshOutbound"]
+    check("outbound: full store evicts OLDEST deterministically",
+          len(ob) <= DSH_OUTBOUND_MAX and "M-oldest" not in ob
+          and "M-newest" in ob and "M-trigger" in ob)
+    # malformed entries pruned
+    st["dshOutbound"]["M-bad"] = {"oops": 1}
+    prune_outbound(st)
+    save_state(st)
+    check("outbound: malformed entries pruned",
+          "M-bad" not in load_state()["dshOutbound"])
+    # restart durability: entry persisted in line-state.json survives reload
+    st2 = load_state()
+    check("outbound: persisted across load_state (restart durability)",
+          dsh_sent_message_id(st2, "M-trigger", "group:Gx"))
+    # load_state normalization drops foreign malformed entries
+    st3 = load_state()
+    st3["dshOutbound"]["M-bad2"] = "not-a-dict"
+    mod_normalize = load_state()
+    check("outbound: load_state drops malformed foreign entries",
+          isinstance(mod_normalize["dshOutbound"], dict)
+          and "M-bad2" not in load_state()["dshOutbound"])
 
     print(f"  result: {'ALL PASS' if not failures else f'FAILURES: {failures}'}")
     return 0 if not failures else 1

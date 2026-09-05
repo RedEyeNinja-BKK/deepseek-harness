@@ -1,0 +1,96 @@
+# DSH capability manifest — canonical source of truth for help/UI generation.
+# Hand-maintained (no generator). Statuses are honest: `live` = deployed and
+# accepted; `staged` = built/reviewed, awaiting deployment acceptance;
+# `planned` = designed but not built; `absent` = not available.
+# Guides (guide-en.md / guide-th.md) and future Rich Menu definitions derive
+# from / validate against this file.
+version: 1
+updated: "2026-09-05"
+surfaces:
+  line-dm:            "1:1 chat with the DSH LINE official account (admitted users only)"
+  line-family-group:  "the approved family group (roster members only)"
+  discord:            "Discord (operator-approved channels)"
+
+capabilities:
+  - id: conversation
+    labelEn: "Chat with DSH"
+    labelTh: "คุยกับ DSH"
+    descEn: "Ask questions, chat, get help — normal conversation in Thai or English."
+    descTh: "ถามตอบ สนทนา ขอความช่วยเหลือทั่วไปเป็นภาษาไทยหรืออังกฤษ"
+    status: live
+    channels: [line-dm, line-family-group]
+    admission: "approved family roster (group) or admitted DM user"
+    invocation:
+      - method: dm-direct
+        status: live
+      - method: group-self-mention
+        status: live
+      - method: group-reply-to-dsh
+        status: live
+        note: "reply (LINE Reply) to a message DSH itself sent in the same conversation"
+    examples:
+      - "@DSH what time is it?"
+      - "(DM) ช่วยอธิบายหน่อยว่าบัตรประชาชนทำอะไรได้บ้าง"
+    input: [text]
+    limits: "group messages without an @DSH mention never summon DSH; replies only count when quoting a message DSH itself sent"
+
+  - id: translate
+    labelEn: "EN<->TH translation"
+    labelTh: "แปลไทย-อังกฤษ"
+    descEn: "Translate text between English and Thai. Detects direction automatically; keeps names, links, numbers and emojis intact; output is the translation only."
+    descTh: "แปลข้อความระหว่างไทยกับอังกฤษโดยตรวจจับภาษาอัตโนมัติ คงชื่อ ลิงก์ ตัวเลข และอีโมจิไว้ แสดงผลเฉพาะคำแปล"
+    status: live
+    channels: [line-dm, line-family-group]
+    admission: "same as conversation"
+    invocation:
+      - method: explicit-command
+        formEn: "translate <text>"
+        formTh: "translate <ข้อความ>"
+        status: live
+        note: "in the group, use it together with @DSH or a reply to DSH: `@DSH translate <text>`"
+    examples:
+      - "translate Good morning, see you at the market"
+      - "@DSH translate พรุ่งนี้เจอกันตลาดนัดตอนเก้าโมง"
+    input: [text]
+    limits: "source text up to 4000 characters; one language pair (EN<->TH); if the service is down you get a short 'unavailable' notice, never a made-up answer"
+
+  - id: web-research
+    labelEn: "Web search & fetch"
+    labelTh: "ค้นหาและอ่านเว็บ"
+    descEn: "Search the web and read pages when a question needs current information."
+    descTh: "ค้นหาข้อมูลและอ่านหน้าเว็บเมื่อคำถามต้องการข้อมูลปัจจุบัน"
+    status: live
+    channels: [line-dm, line-family-group]
+    admission: "same as conversation"
+    invocation:
+      - method: dm-direct
+        status: live
+      - method: group-self-mention
+        status: live
+    examples:
+      - "@DSH ทองวันนี้ราคาเท่าไหร่"
+    input: [text]
+    limits: "no login-only sites; speed depends on the target site"
+
+  - id: multimedia
+    labelEn: "Image generation"
+    labelTh: "สร้างรูปภาพ"
+    descEn: "Generate images from a description."
+    descTh: "สร้างรูปภาพจากคำอธิบาย"
+    status: planned
+    channels: [line-dm]
+    note: "not yet connected — image generation is not available today"
+
+  - id: rich-menu
+    labelEn: "Rich Menu"
+    labelTh: "เมนูรูปภาพ"
+    descEn: "A tappable menu attached to the 1:1 chat with DSH."
+    descTh: "เมนูแบบแตะได้ที่แสดงในแชทส่วนตัวกับ DSH"
+    status: planned
+    channels: [line-dm]
+    note: "LINE shows rich menus in 1:1 chats only — never inside group chats"
+
+  - id: reminders
+    labelEn: "Reminders"
+    labelTh: "ตั้งเตือน"
+    status: absent
