@@ -5,7 +5,7 @@
 # Guides (guide-en.md / guide-th.md) and future Rich Menu definitions derive
 # from / validate against this file.
 version: 1
-updated: "2026-09-05"
+updated: "2026-09-06"
 surfaces:
   line-dm:            "1:1 chat with the DSH LINE official account (admitted users only)"
   line-family-group:  "the approved family group (roster members only)"
@@ -75,11 +75,27 @@ capabilities:
   - id: multimedia
     labelEn: "Image generation"
     labelTh: "สร้างรูปภาพ"
-    descEn: "Generate images from a description."
-    descTh: "สร้างรูปภาพจากคำอธิบาย"
-    status: planned
-    channels: [line-dm]
-    note: "not yet connected — image generation is not available today"
+    descEn: "Generate an image from a description and receive it right in the chat."
+    descTh: "สร้างรูปภาพจากคำอธิบาย แล้วได้รับรูปส่งตรงในแชท"
+    status: live
+    channels: [line-dm, line-family-group, discord]
+    admission: "same as conversation"
+    invocation:
+      - method: dm-direct
+        status: live
+        note: "in a DM just describe the picture, no command needed"
+      - method: group-self-mention
+        status: live
+        note: "in the group use @DSH together with the description"
+      - method: discord-channel
+        status: live
+        note: "in an approved DSH Discord channel just describe the picture; no mention required"
+    examples:
+      - "สร้างรูปแมวส้มนอนบนขอบหน้าต่างตอนพระอาทิตย์ตก หนึ่งรูป"
+      - "@DSH สร้างรูปทุ่งทานตะวันยามเช้า หนึ่งรูป"
+      - "Please draw a small wooden boat on a calm lake in morning mist."
+    input: [text]
+    limits: "one image per request; takes about 1-3 minutes; describe the picture in words - editing an existing photo is not supported yet; if the image service is busy you get a short honest notice, never a fake image"
 
   - id: rich-menu
     labelEn: "Rich Menu"

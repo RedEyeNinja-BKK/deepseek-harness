@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 """dsh_line_inbound.py (v3) — minimal LINE Messaging API webhook for DSH.
 
+v1.4.3 (2026-09-05): structured image delivery. When a DSH final reply is a
+trusted multimedia envelope (exactly one JSON object: either the v1
+dsh-image tool result {ok,completed,requested,images[]} or the typed
+{"type":"image","schema":1,"source":"dsh-image-v1",...} form), the adapter
+sends a real LINE image message (originalContentUrl/previewImageUrl) BEFORE
+any text. ONLY tx_id is trusted — public URLs are resolved server-side from
+the tx id against the NFS final directory (existence + LINE size caps
+verified) under the fixed public media origin; model-supplied URLs are never
+used, so a model cannot mint privileged image sends. Detection is strict
+(single JSON object, no surrounding prose/markdown/code fences, length-capped,
+no HTML), so plain and markdown text replies are unaffected. Missing/invalid
+artifact -> no image send, bounded text fallback (fail closed). All v1
+delivery semantics (chunking, X-Line-Retry-Key idempotency, pending/retry
+reservation, dedupe, outbound-id capture) are preserved verbatim.
+
 Mirrors the proven dsh_discord_inbound.py architecture (operator GO 2026-09-03):
 one narrow job — receive LINE inbound messages, normalize them, feed them into
 DSH via the public session RPC (session.create / session.prompt), then send
@@ -115,6 +130,18 @@ CLIENT_TZ = "Asia/Bangkok"
 
 TEXT_CHUNK_MAX = 4500          # LINE text limit 5000; margin for envelope safety
 MAX_PUSH_MESSAGES = 5          # LINE push API hard limit
+
+# --- structured image delivery (v1.4.3) -------------------------------------
+# Only the tx_id inside a DSH multimedia envelope is trusted. Public URLs are
+# NEVER taken from the model: they are derived server-side from the tx_id and
+# verified on disk against LINE's size caps before any image push.
+MEDIA_PUBLIC_ORIGIN = "https://localclaw-vm.YOUR-TAILNET.ts.net:8446"
+MEDIA_NFS_ROOT = Path("/mnt/off-vm-nfs/comfyui-media")
+MEDIA_TX_RE = re.compile(r"^comfy-[0-9]+-[0-9]+-[0-9a-f]+$")
+MEDIA_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+MEDIA_ENVELOPE_MAX = 20000     # candidate JSON envelope cap (chars)
+MEDIA_ORIG_MAX_BYTES = 10 * 1024 * 1024   # LINE originalContentUrl cap
+MEDIA_PREVIEW_MAX_BYTES = 1 * 1024 * 1024 # LINE previewImageUrl cap
 PUSH_TIMEOUT_S = 30
 PUSH_MAX_ATTEMPTS = 2          # one 429 Retry-After retry within one delivery
 PUSH_RETRY_BACKOFF_CAP_S = 30.0
@@ -829,6 +856,101 @@ def line_request(method: str, path: str, *, json_body=None, extra_headers=None,
         raise LineHttpError(label, None) from e
 
 
+# --- structured image delivery (v1.4.3) -------------------------------------
+
+def detect_media_envelope(reply: str) -> dict | None:
+    """Detect a trusted DSH multimedia envelope in a final reply. Returns
+    {"tx_id", "count"} or None. Strict: the WHOLE reply must be exactly one
+    JSON object (no surrounding prose/markdown/code fences; oversized or
+    HTML-ish strings are not envelopes). Trust boundary: values in the
+    envelope are metadata only — nothing here is used to build the image
+    send except tx_id (regex-validated); URLs/paths from the model are
+    ignored by design."""
+    if not isinstance(reply, str) or not reply:
+        return None
+    s = reply.strip()
+    if not (s.startswith("{") and s.endswith("}")):
+        return None
+    if len(s) > MEDIA_ENVELOPE_MAX or "<" in s or ">" in s:
+        return None
+    try:
+        env = json.loads(s[:MEDIA_ENVELOPE_MAX])
+    except Exception:
+        return None
+    if not isinstance(env, dict):
+        return None
+
+    if env.get("type") == "image":
+        # typed envelope form (future server-side emit):
+        if env.get("schema") != 1 or env.get("source") != "dsh-image-v1":
+            return None
+        if set(env) - {"type", "schema", "source", "tx_id", "width", "height", "mime"}:
+            return None
+        tx = env.get("tx_id")
+        if not isinstance(tx, str):
+            return None
+        return {"tx_id": tx, "count": 1}
+
+    # v1 tool-result form (current dsh_image_adapter output):
+    if env.get("ok") is not True or "images" not in env:
+        return None
+    completed, requested = env.get("completed"), env.get("requested")
+    images = env.get("images")
+    if (not isinstance(completed, int) or isinstance(completed, bool)
+            or not isinstance(requested, int) or isinstance(requested, bool)
+            or not (1 <= completed <= 2) or requested not in (1, 2)
+            or completed > requested
+            or not isinstance(images, list) or len(images) != completed):
+        return None
+    for img in images:
+        if not isinstance(img, dict) or not isinstance(img.get("tx_id"), str):
+            return None
+        if not MEDIA_TX_RE.match(img["tx_id"]):
+            return None
+    return {"tx_id": images[0]["tx_id"], "count": len(images)}
+
+
+def resolve_media_payload(tx_id: str) -> dict | None:
+    """Resolve a tx_id to a verified LINE image payload SERVER-SIDE. Only
+    exact convention filenames of the tx final directory are considered
+    (regex-validated tx_id; no model text in any path component). Returns
+    None unless the artifact (and, when present, its preview sibling) exist
+    on NFS and satisfy LINE's size caps — fail closed to text otherwise."""
+    if not isinstance(tx_id, str) or not MEDIA_TX_RE.match(tx_id):
+        return None
+    final_dir = MEDIA_NFS_ROOT / "image" / tx_id / "final"
+    try:
+        finals = sorted(p for p in final_dir.iterdir()
+                        if p.is_file() and not p.name.endswith(".preview.jpg")
+                        and MEDIA_NAME_RE.match(p.name))
+    except OSError:
+        return None
+    if not finals:
+        return None
+    art = finals[0]
+    try:
+        if art.stat().st_size <= 0 or art.stat().st_size > MEDIA_ORIG_MAX_BYTES:
+            return None
+    except OSError:
+        return None
+    prev = art.with_name(art.stem + ".preview.jpg")
+    preview_url = None
+    if prev.is_file():
+        try:
+            ps = prev.stat().st_size
+            if 0 < ps <= MEDIA_PREVIEW_MAX_BYTES:
+                preview_url = f"{MEDIA_PUBLIC_ORIGIN}/media/image/{tx_id}/final/{prev.name}"
+        except OSError:
+            pass
+    if preview_url is None:
+        return None  # fail closed: never serve original as preview
+    return {
+        "type": "image",
+        "originalContentUrl": f"{MEDIA_PUBLIC_ORIGIN}/media/image/{tx_id}/final/{art.name}",
+        "previewImageUrl": preview_url,
+    }
+
+
 def push_messages(to_id: str, texts: list[str], retry_key_seed: str):
     """Send text messages via Push API with 429 Retry-After-aware bounded retry.
     texts must already be chunked via chunk_reply_text(). Idempotent per
@@ -1329,8 +1451,28 @@ def chunk_reply_text(reply: str) -> list[str]:
 def _push_claimed(state: dict, claim: dict, message_id: str) -> None:
     """Perform the push for a claimed delivery. Raises on failure. Captures
     the sent-message IDs from the Push response (sentMessages[].id) into the
-    bounded outbound-author memory (reply-to-DSH proof; no bodies)."""
-    resp = push_messages(claim["to"], chunk_reply_text(claim["reply"]),
+    bounded outbound-author memory (reply-to-DSH proof; no bodies).
+    v1.4.3: when the reply is a trusted multimedia envelope with a verifiable
+    artifact, a real LINE image message is pushed BEFORE the text (which then
+    carries only a short caption; the envelope JSON is never shown raw)."""
+    media = detect_media_envelope(claim["reply"])
+    image_msg = None
+    caption_seed = claim["reply"]
+    if media:
+        image_msg = resolve_media_payload(media["tx_id"])
+        if image_msg is None:
+            caption_seed = ("The image could not be delivered (artifact "
+                            "verification failed — it is safely stored and "
+                            "will not be lost).")
+    if image_msg is not None:
+        msgs = [image_msg, {"type": "text", "text": "🖼️ Your generated image."}]
+        retry_key = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                   f"dsh-line:{message_id}:media"))
+        line_request("POST", "/message/push", label="push-media",
+                     json_body={"to": claim["to"], "messages": msgs},
+                     extra_headers={"X-Line-Retry-Key": retry_key})
+        caption_seed = "🖼️ Your generated image."
+    resp = push_messages(claim["to"], chunk_reply_text(caption_seed),
                          retry_key_seed=message_id)
     sent = None
     if isinstance(resp, dict):
@@ -1984,7 +2126,7 @@ def main() -> None:
     WebhookHandler.executor = ThreadPoolExecutor(
         max_workers=4, thread_name_prefix="line-worker")
     server = http.server.ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), WebhookHandler)
-    log.info("dsh-line-inbound v1.4.2 (identity+admission+translate+reply) "
+    log.info("dsh-line-inbound v1.4.3 (identity+admission+translate+reply+image) "
              "listening on %s:%d%s",
              LISTEN_HOST, LISTEN_PORT, WEBHOOK_PATH)
     import threading as _t
@@ -2494,6 +2636,50 @@ def selftest() -> int:
     check("outbound: load_state drops malformed foreign entries",
           isinstance(mod_normalize["dshOutbound"], dict)
           and "M-bad2" not in load_state()["dshOutbound"])
+
+    # 15. structured image delivery (v1.4.3) — detection + server-side
+    #     resolution; no network, no credentials.
+    good_tx = "comfy-1788621453-1-fb48ea"
+    env_v1 = json.dumps({"ok": True, "completed": 1, "requested": 1, "images": [
+        {"tx_id": good_tx, "ref": "multimedia:image:x",
+         "artifact": "/mnt/off-vm-nfs/comfyui-media/image/%s/final/x.png" % good_tx,
+         "original_url": "https://evil.example/x.png",
+         "preview_url": "https://evil.example/x.jpg"}]}).strip()
+    det = detect_media_envelope(env_v1)
+    check("media: v1 envelope detected", det is not None
+          and det["tx_id"] == good_tx)
+    check("media: detection ignores model URLs",
+          detect_media_envelope(json.dumps({"ok": True, "completed": 1,
+              "requested": 1, "images": [{"tx_id": "comfy-1-1-abc", "url": "x"}]})) is not None)
+    check("media: prose+JSON not detected",
+          detect_media_envelope("Here is your image! " + env_v1) is None)
+    check("media: code-fenced JSON not detected",
+          detect_media_envelope("```json\n" + env_v1 + "\n```") is None)
+    check("media: two objects not detected",
+          detect_media_envelope(env_v1 + env_v1) is None)
+    check("media: oversized candidate rejected",
+          detect_media_envelope("{" + "x" * (MEDIA_ENVELOPE_MAX + 1) + "}") is None)
+    check("media: html-ish candidate rejected",
+          detect_media_envelope('{"a":"<b>"}') is None)
+    typed = json.dumps({"type": "image", "schema": 1, "source": "dsh-image-v1",
+                        "tx_id": good_tx})
+    det2 = detect_media_envelope(typed)
+    check("media: typed envelope detected", det2 is not None
+          and det2["tx_id"] == good_tx)
+    check("media: typed wrong source rejected",
+          detect_media_envelope(json.dumps({"type": "image", "schema": 1,
+              "source": "not-dsh", "tx_id": "comfy-1-1-abc"})) is None)
+    check("media: typed foreign key rejected",
+          detect_media_envelope(json.dumps({"type": "image", "schema": 1,
+              "source": "dsh-image-v1", "tx_id": "comfy-1-1-abc",
+              "original_url": "https://evil.example/a.png"})) is None)
+    check("media: failed tool result not detected",
+          detect_media_envelope(json.dumps({"ok": False, "classification": "timeout",
+              "error": "x"})) is None)
+    check("media: plain text not detected",
+          detect_media_envelope("A normal reply about images") is None)
+    check("media: malformed tx fails closed", resolve_media_payload("../../etc") is None)
+    check("media: non-string tx fails closed", resolve_media_payload(12345) is None)
 
     print(f"  result: {'ALL PASS' if not failures else f'FAILURES: {failures}'}")
     return 0 if not failures else 1
