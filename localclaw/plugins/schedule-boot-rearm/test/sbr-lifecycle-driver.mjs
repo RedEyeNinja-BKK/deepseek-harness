@@ -16,8 +16,9 @@
  *
  * Writes COMPLETE-LIFECYCLE.json with the assertion summary, then exits.
  */
-import { writeFileSync, readFileSync } from 'node:fs'
+import { writeFileSync, readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
+import { readdirSync } from 'node:fs'
 
 export const name = 'sbr-lifecycle-driver'
 export const inject = ['agents', 'sessionPersistence']
@@ -27,6 +28,20 @@ const withTimeout = (p, ms, what) => Promise.race([
   p,
   delay(ms).then(() => { throw new Error(`TIMEOUT ${what}`) }),
 ])
+
+function durableFileExists(sid) {
+  // The driver runs inside the dsh process and can read $DSH_HOME/sessions.
+  try {
+    const root = process.env.DSH_HOME ? join(process.env.DSH_HOME, 'sessions') : ''
+    if (!root) return false
+    for (const ws of readdirSync(root, { withFileTypes: true })) {
+      if (!ws.isDirectory()) continue
+      const p = join(root, ws.name, sid, 'session.jsonl.zstd')
+      try { if (existsSync(p) && readFileSync(p).length > 0) return true } catch {}
+    }
+  } catch {}
+  return false
+}
 
 function scheduleRows(session) {
   try {
@@ -101,8 +116,11 @@ export function apply(ctx) {
       } catch { disposedOk = false }
       log('after unload: A live=' + live(A) + ' C live=' + live(C) + ' disposedOk=' + disposedOk)
 
-      // durable session state must survive unload (persisted jsonl remains)
-      const durableKept = !!(s1a.rows && s1a.rows.length > 0) // rows captured while live prove durable state; file presence checked by parent harness
+      // durable session state must survive unload: the actual persisted file
+      // must still exist (and be non-empty) AFTER S1 unload disposed the live
+      // agent — remount would otherwise recreate a fresh, empty session.
+      const durableKept = durableFileExists(A) && durableFileExists(C)
+      log('after unload: durable files present A=' + durableFileExists(A) + ' C=' + durableFileExists(C))
 
       log('mount child #2')
       const child2 = await mount()
