@@ -51,12 +51,14 @@ disturbs unrelated sessions.
 
 ## Config
 
-Home-level `cordis.patch.yml` row (place it after the `schedule` row):
+Home-level `cordis.patch.yml` row (place it after the `schedule` row; the
+specifier MUST be absolute — Cordis resolves relative entry names against the
+profile directory, so a home-level `./…` name would resolve per-profile):
 
 ```yaml
 - insert:
   - id: schedule-boot-rearm
-    name: './plugins/schedule-boot-rearm.mjs'
+    name: '/opt/dsh/home/plugins/schedule-boot-rearm.mjs'
     config:
       scheduleSessionIds:
         - session-00000000-0000-0000-0000-000000000000   # replace: schedule owner ids
@@ -82,7 +84,11 @@ native persistence index before any resume.
 
 ## Journal evidence
 
-All lines are prefixed `[schedule-boot-rearm]`:
+All journal lines are prefixed `[schedule-boot-rearm]`; the same lines are also
+appended (best-effort, rotated at 1 MiB) to
+`$DSH_HOME/plugins/schedule-boot-rearm.log` so acceptance/health tooling can
+read them without depending on the logger transport. The directory is created
+by the plugin at first boot. Journald remains the authoritative record.
 
 ```
 boot: start; configured schedule owner(s) = 2
@@ -100,6 +106,17 @@ GO §8 pre-production proofs (mount, resume, schedule re-arm, pin parity,
 idempotence, missing-target fail-narrow, no `session.*` RPC in source).
 Requires the installed rc.2 tree (`/opt/dsh/node_modules/.bin/dsh`) and a
 reachable anonymous OpenAI-compatible gateway at `127.0.0.1:4000`.
+
+## Readiness gate
+
+Before any resume the plugin waits for the `@deepseek-ai/dsh-schedule` loader
+entry to become **active** (`ctx.loader.entries()` entry with an installed
+fiber), because schedule tools attach only to root agents created after the
+schedule plugin's `agent/created` listener is installed. If the entry is present
+but never activates within 60s the plugin fails closed (skips re-arm this
+start; the external oneshot remains the rollback path). If the loader
+entry-state API is unavailable or the entry is absent, it falls back to a short
+settle and proceeds with a warning.
 
 ## Known limitations and deferred work
 

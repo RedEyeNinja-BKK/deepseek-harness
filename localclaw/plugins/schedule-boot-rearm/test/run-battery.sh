@@ -156,11 +156,21 @@ note "phase1 evidence: $(python3 -c 'import json;d=json.load(open("'$EVID'/COMPL
 
 # ---- static source checks ----
 note "[static] plugin source checks"
-if grep -qE "session\.(models|prompt|list|create)|/api/|https?://|fetch\(" "$PLUGIN"; then
+if grep -qE "session\.(models|prompt|list|create)|/api/|https?://|fetch\(|XMLHttpRequest|WebSocket" "$PLUGIN"; then
   bad "plugin references browser/session RPC or http"
 else
   ok "plugin has no browser /api or session.* RPC usage"
 fi
+if python3 - "$PLUGIN" <<'PY'
+import re,sys
+src=open(sys.argv[1],encoding='utf-8').read()
+allowed={'node:fs','node:path','@deepseek-ai/dsh-agent','@deepseek-ai/schemastery'}
+imports=re.findall(r"^import\s+.*?\s+from\s+'([^']+)'",src,re.M)
+unknown=[i for i in imports if i not in allowed]
+print(('  PASS  ' if not unknown else '  FAIL  ')+f"import allowlist respected (imports={sorted(set(imports))})")
+sys.exit(1 if unknown else 0)
+PY
+then ok "import allowlist check"; else bad "import allowlist check"; fi
 if grep -q "ctx.agents.resume" "$PLUGIN"; then ok "plugin uses ctx.agents.resume"; else bad "plugin missing ctx.agents.resume"; fi
 if cmp -s "$PLUGIN" "$HOME_DIR/plugins/schedule-boot-rearm.mjs"; then ok "overlay copy byte-identical to canonical"; else bad "overlay copy drift"; fi
 

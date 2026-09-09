@@ -86,3 +86,9 @@
   # no browser session.* RPC, no gold special-casing. Ids below are the
   # schedule-owner sessions (deployment state; the same list the oneshot read
   # from DSH_SCHEDULE_SESSIONS).
+  - id: schedule-boot-rearm
+    name: '/opt/dsh/home/plugins/schedule-boot-rearm.mjs'
+    config:
+      scheduleSessionIds:
+        - session-bb8442f9-3320-498e-9278-8d88db60d3f2
+        - session-e5dc0463-536a-419a-8e27-9b5c2417358f

@@ -57,7 +57,7 @@
  */
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import Schema from '@deepseek-ai/schemastery'
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, renameSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
 export const name = 'schedule-boot-rearm'
@@ -73,8 +73,10 @@ export const Config = Schema.object({
 const SID_RE = /^session-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
 /** Small settle after the loader tree is idle so the schedule plugin is provably listening. */
 const SETTLE_MS = 1500
-/** How long we wait for the loader tree to reach idle before proceeding anyway. */
+/** How long we wait for the schedule loader entry to become active before failing closed. */
 const LOADER_WAIT_MS = 60000
+/** Evidence file rotates past this many bytes (diagnostic output; journald is authoritative). */
+const EVIDENCE_MAX_BYTES = 1024 * 1024
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -85,9 +87,26 @@ function evidenceLogPath() {
     if (!home) return undefined
     const dir = join(home, 'plugins')
     const path = join(dir, 'schedule-boot-rearm.log')
+    mkdirSync(dir, { recursive: true, mode: 0o750 })
     return { dir, path }
   } catch {
     return undefined
+  }
+}
+
+/** Best-effort append with one-file rotation at EVIDENCE_MAX_BYTES. */
+function appendEvidence(path, line) {
+  try {
+    try {
+      if (statSync(path).size > EVIDENCE_MAX_BYTES) {
+        try { renameSync(path, `${path}.1`) } catch { /* best-effort rotation */ }
+      }
+    } catch {
+      /* file absent -> plain append */
+    }
+    appendFileSync(path, line)
+  } catch {
+    /* diagnostic only; journald remains authoritative */
   }
 }
 
@@ -147,7 +166,13 @@ function installSessionSelection(agentCtx, ctx) {
     },
     assembled: undefined,
   }
-  return installModelSelection(agentCtx, selection)
+  // installModelSelection registers two agent-scoped listeners and returns a
+  // disposer. That disposer is intentionally NOT returned from this setup: the
+  // AgentSetup contract only accepts void/AgentSetupCommit, and the listeners
+  // are owned by the agent scope (unwound with it), exactly as
+  // dsh-host-apiproxy's installSelection treats them. Retaining the disposer
+  // would risk double-cleanup; returning it would break the factory boundary.
+  installModelSelection(agentCtx, selection)
 }
 
 /** Count durable schedule/change records in a live session's event log (read-only). */
@@ -185,14 +210,63 @@ export function apply(ctx, entryConfig) {
   let stopping = false
   const started = new Set() // ids this plugin instance already handled this process
 
-  async function waitForLoaderIdle() {
-    const loader = ctx.get('loader')
-    if (!loader || typeof loader.await !== 'function') return false
+  /** Schedule loader-entry active state: true=active; false=present-but-inactive; null=unknown/absent. */
+  function scheduleLoaderState() {
     try {
-      await Promise.race([loader.await(), sleep(LOADER_WAIT_MS)])
-      return true
+      const loader = ctx.get('loader')
+      const entries = loader && typeof loader.entries === 'function' ? loader.entries() : null
+      if (!entries) return null
+      let found = false
+      for (const entry of entries) {
+        const options = entry?.options ?? {}
+        if (options?.id === 'schedule' || options?.name === '@deepseek-ai/dsh-schedule') {
+          found = true
+          if (entry?.fiber) return true
+        }
+      }
+      return found ? false : null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Wait until the @deepseek-ai/dsh-schedule entry is active (its agent/created
+   * listener is installed) before any resume. Fails closed when the entry is
+   * present but never activates. Falls back to settle-based ordering only when
+   * the loader entry-state API is unavailable or the entry is absent.
+   */
+  async function waitForScheduleActive() {
+    try {
+      const loader = ctx.get('loader')
+      if (loader && typeof loader.await === 'function') {
+        try {
+          await Promise.race([loader.await(), sleep(LOADER_WAIT_MS)])
+        } catch (error) {
+          log(`loader.await() reported a settled failure: ${String(error)}`, 'warn')
+        }
+      }
+      const deadline = Date.now() + LOADER_WAIT_MS
+      for (;;) {
+        const state = scheduleLoaderState()
+        if (state === true) {
+          log('schedule plugin entry active (agent/created listener installed)')
+          return true
+        }
+        if (state === null) {
+          log('schedule plugin entry not observable via loader state; proceeding after settle (no fail-closed signal available)', 'warn')
+          await sleep(SETTLE_MS)
+          return true
+        }
+        if (Date.now() >= deadline) {
+          log('schedule plugin entry present but not active before deadline; skipping boot re-arm this start (external oneshot remains the rollback path)', 'error')
+          return false
+        }
+        await sleep(1000)
+      }
     } catch (error) {
-      log(`loader.await() reported a settled failure: ${String(error)}`, 'warn')
+      log(`schedule-readiness check failed: ${String(error)}; proceeding after settle`, 'warn')
+      await sleep(SETTLE_MS)
       return true
     }
   }
@@ -211,14 +285,19 @@ export function apply(ctx, entryConfig) {
 
   async function boot() {
     try {
-      const valid = rawIds.filter((id) => SID_RE.test(String(id).trim()))
-      const invalid = rawIds.length - valid.length
+      // Deduplicate and validate configured ids (diagnose config mistakes).
+      const trimmed = rawIds.map((id) => String(id).trim())
+      const unique = [...new Set(trimmed)]
+      const duplicates = trimmed.length - unique.length
+      if (duplicates > 0) log(`config: removed ${duplicates} duplicate id(s)`)
+      const valid = unique.filter((id) => SID_RE.test(id))
+      const invalid = unique.length - valid.length
       if (invalid > 0) log(`config: ${invalid} invalid id(s) rejected (must be session-UUID)`)
       log(`boot: start; configured schedule owner(s) = ${valid.length}${valid.length ? '' : ' (none)'}`, 'info')
 
-      // Let the full entry tree (schedule plugin included) reach idle before
-      // any resume so agent/created is guaranteed to be observed by schedule.
-      await waitForLoaderIdle()
+      // Deterministic gate: only resume once the schedule plugin's own
+      // agent/created listener is installed, so every resume re-arms through it.
+      if (!(await waitForScheduleActive())) return
       await sleep(SETTLE_MS)
 
       const defaults = defaultAgentOptions(ctx)
