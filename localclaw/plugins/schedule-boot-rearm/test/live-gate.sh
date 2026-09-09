@@ -137,14 +137,17 @@ make_manifest() { # <label>
 {"label":"$1","ts":"$TS","state":"created","stateAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","pluginSha256":"$CANONICAL_SHA256","sidA":"$SID_A","sidB":"$SID_B"}
 EOF
 }
-manifest_step() { # <manifest.json> <state>
+manifest_step() { # <manifest.json> <state>  (writes state + appends append-only history)
   "$PY" - "$1" "$2" <<'PY'
-import json,sys,datetime
-try: d=json.load(open(sys.argv[1]))
+import json,sys,datetime,os
+path,state=sys.argv[1:3]
+try: d=json.load(open(path))
 except Exception: sys.exit(0)
-d["state"]=sys.argv[2]
+d["state"]=state
 d["stateAt"]=datetime.datetime.utcnow().isoformat()+"Z"
-json.dump(d,open(sys.argv[1],"w"),indent=2)
+json.dump(d,open(path,"w"),indent=2)
+hist=os.path.join(os.path.dirname(path),"steps.log")
+with open(hist,"a") as f: f.write(f"{state} {d['stateAt']}\n")
 PY
 }
 latest_txn() { ls -1dt "$EVID"/txn-* 2>/dev/null | head -1 || true; }
