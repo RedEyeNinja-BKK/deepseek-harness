@@ -130,6 +130,16 @@ step() { STEP=$((STEP+1)); log "step $STEP: $*"; }
 die()  { log "FATAL: $*"; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
 sha()  { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+# owner:group on a file: as root it is MANDATORY (failure stops); non-root
+# (hermetic overlay only) it is best-effort because the test user cannot chown
+# to system service users.
+chown_effort() { # <owner:group> <file>
+  if [ "$(id -u)" = 0 ]; then
+    chown "$1" "$2" || return 1
+  else
+    chown "$1" "$2" >/dev/null 2>&1 || true
+  fi
+}
 
 # ---------- hermetic guard ----------------------------------------------------
 if [ "${S2_GATE_HERMETIC:-0}" = "1" ]; then
@@ -489,7 +499,7 @@ file_snapshot() { # file_snapshot <txn-file> <path>
   if [ -e "$2" ]; then cp -a "$2" "$1"; else printf 'ABSENT\n' > "$1"; fi
 }
 restore_snapshot() { # restore_snapshot <txn-file> <path> <mode> <owner> <group>
-  local src="$1" dst="$2" mode="$3" owner="$4" grp="$5" tmp
+  local src="$1" dst="$2" mode="$3" owner="$4" grp="$5" tmp got
   if grep -q '^ABSENT$' "$src" 2>/dev/null; then
     rm -f "$dst"
     log "restore: $dst removed (was absent)"
@@ -497,10 +507,16 @@ restore_snapshot() { # restore_snapshot <txn-file> <path> <mode> <owner> <group>
   fi
   [ -f "$src" ] || { log "restore: no snapshot for $dst"; return 1; }
   tmp="$dst.tmp-restore.$TS.$$"
-  cp "$src" "$tmp"
-  chmod "$mode" "$tmp"
-  chown "$owner:$grp" "$tmp" 2>/dev/null || true
-  mv "$tmp" "$dst"
+  cp "$src" "$tmp" || return 1
+  chmod "$mode" "$tmp" || { rm -f "$tmp"; return 1; }
+  if [ "$(id -u)" = 0 ]; then
+    chown "$owner:$grp" "$tmp" || { rm -f "$tmp"; log "restore: chown $owner:$grp FAILED for $dst"; return 1; }
+    got="$(stat -c %U:%G "$tmp" 2>/dev/null || true)"
+    if [ "$got" != "$owner:$grp" ]; then rm -f "$tmp"; log "restore: ownership mismatch $got for $dst"; return 1; fi
+  else
+    chown "$owner:$grp" "$tmp" >/dev/null 2>&1 || true
+  fi
+  mv "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
   log "restore: $dst replaced"
 }
 
@@ -825,17 +841,21 @@ if not isinstance(d,dict) or list(d.keys())!= [conv]: sys.exit(1)
 PY
   fi
   manifest_step rollback-start
-  "$PY" -c 'import json,sys;json.dump({sys.argv[1]:"QUIESCING_TO_OLD"},open(sys.argv[2],"w"))' \
-      "$conv" "$ROUTE_FILE"
-  chown dsh-discord:dsh-discord "$ROUTE_FILE" 2>/dev/null || true
-  chmod 0640 "$ROUTE_FILE"
+  # QUIESCING_TO_OLD: checked atomic write
+  local rtmp="$ROUTE_FILE.s2-rb-$TS.$$"
+  "$PY" -c 'import json,sys;json.dump({sys.argv[1]:sys.argv[2]},open(sys.argv[3],"w"))' "$conv" "QUIESCING_TO_OLD" "$rtmp" || { rm -f "$rtmp"; return 1; }
+  chown_effort dsh-discord:dsh-discord "$rtmp" || { rm -f "$rtmp"; return 1; }
+  chmod 0640 "$rtmp" || { rm -f "$rtmp"; return 1; }
+  mv "$rtmp" "$ROUTE_FILE" || { rm -f "$rtmp"; return 1; }
   req "route file QUIESCING_TO_OLD written" route_matches "$ROUTE_FILE" "$conv" QUIESCING_TO_OLD || return 1
   log "quiesce window ${SETTLE_S}s (in-flight pilot turns settle)"
   sleep "$SETTLE_S"
-  "$PY" -c 'import json,sys;json.dump({sys.argv[1]:"OLD"},open(sys.argv[2],"w"))' \
-      "$conv" "$ROUTE_FILE"
-  chown dsh-discord:dsh-discord "$ROUTE_FILE" 2>/dev/null || true
-  chmod 0640 "$ROUTE_FILE"
+  # OLD: checked atomic write
+  rtmp="$ROUTE_FILE.s2-rb-$TS.$$"
+  "$PY" -c 'import json,sys;json.dump({sys.argv[1]:sys.argv[2]},open(sys.argv[3],"w"))' "$conv" "OLD" "$rtmp" || { rm -f "$rtmp"; return 1; }
+  chown_effort dsh-discord:dsh-discord "$rtmp" || { rm -f "$rtmp"; return 1; }
+  chmod 0640 "$rtmp" || { rm -f "$rtmp"; return 1; }
+  mv "$rtmp" "$ROUTE_FILE" || { rm -f "$rtmp"; return 1; }
   req "route file OLD written" route_matches "$ROUTE_FILE" "$conv" OLD || return 1
   run_hello_probe "" --route OLD >/dev/null 2>&1 || log "plugin route push failed (listener pushes on next event)"
   local h
@@ -1017,9 +1037,9 @@ PY
   chmod 0644 "$tmp"; chown root:root "$tmp" 2>/dev/null || true
   mv "$tmp" "$DROPIN"
   req "drop-in installed with exact env file" grep -q "EnvironmentFile=$ENV_FILE" "$DROPIN" \
-      || { rm -f "$ENV_FILE" "$DROPIN"; die "activate env install failed -> rollback done (no restart)"; }
+      || { manifest_step failed; rm -f "$ENV_FILE" "$DROPIN"; die "activate env install failed -> rollback done (no restart)"; }
   req "env file contains exact pilot conv" grep -q "^S2_PILOT_CONV=$S2_PILOT_CONV$" "$ENV_FILE" \
-      || { rm -f "$ENV_FILE" "$DROPIN"; die "activate env value mismatch -> rollback done (no restart)"; }
+      || { manifest_step failed; rm -f "$ENV_FILE" "$DROPIN"; die "activate env value mismatch -> rollback done (no restart)"; }
   systemctl daemon-reload
   manifest_step env-installed
 
@@ -1084,9 +1104,15 @@ activate_failure_rollback() { # auto rollback on activate failure -> staged OLD 
   if ! rm -f "$ENV_FILE" "$DROPIN"; then log "rollback: could not remove env/drop-in"; return 1; fi
   if ! systemctl daemon-reload; then log "rollback: daemon-reload FAILED"; return 1; fi
   if [ -f "$ROUTE_FILE" ]; then
-    "$PY" -c 'import json,sys;json.dump({sys.argv[1]:"OLD"},open(sys.argv[2],"w"))' "$conv" "$ROUTE_FILE"
-    chown dsh-discord:dsh-discord "$ROUTE_FILE" 2>/dev/null || true
-    chmod 0640 "$ROUTE_FILE"
+    # route restoration is itself checked: atomic write -> chmod/chown -> mv,
+    # then read-back below (route_matches) and the probe both verify it.
+    local rtmp="$ROUTE_FILE.s2-rb-$TS.$$"
+    if ! "$PY" -c 'import json,sys;json.dump({sys.argv[1]:"OLD"},open(sys.argv[2],"w"))' "$conv" "$rtmp"; then
+      log "rollback: route write FAILED"; rm -f "$rtmp"; return 1
+    fi
+    if ! chmod 0640 "$rtmp"; then log "rollback: route chmod FAILED"; rm -f "$rtmp"; return 1; fi
+    if ! chown_effort dsh-discord:dsh-discord "$rtmp"; then log "rollback: route chown FAILED"; rm -f "$rtmp"; return 1; fi
+    if ! mv "$rtmp" "$ROUTE_FILE"; then log "rollback: route replace FAILED"; rm -f "$rtmp"; return 1; fi
   fi
   local pre_pid
   pre_pid="$(inbound_mainpid)"
@@ -1142,7 +1168,7 @@ run_rollback() {
 
 run_restore_baseline() {
   log "=== S2 live gate RESTORE-BASELINE (full byte rollback to pre-S2) ==="
-  local stx conv
+  local stx conv t_sid t_provider t_model t_reason t_max
   stx="$(latest_stage_txn)" || die "no PASSED stage txn found to restore from"
   TX="$stx"
   log "restoring from stage txn $stx"
@@ -1158,14 +1184,23 @@ sys.exit(0 if m.get("mode")=="activate" and m.get("state")=="verified" else 1)
 PY
     then die "a verified activate txn is newer than the stage receipt ($ax) — run: $0 rollback  first"; fi
   done
-  # staged-identity constraint: current live state must match the receipt
+  # staged-identity constraint: load the COMPLETE receipt identity (not the
+  # ambient operator env) so the row check is self-contained, then verify the
+  # current live state matches the receipt before any mutation
   conv="$(json_input "$stx/manifest.json" conv)"
-  S2_PILOT_CONV="$conv"
+  t_sid="$(json_input "$stx/manifest.json" sid)"
+  t_provider="$(json_input "$stx/manifest.json" provider)"
+  t_model="$(json_input "$stx/manifest.json" model)"
+  t_reason="$(json_input "$stx/manifest.json" reasoningEffort)"
+  t_max="$(json_input "$stx/manifest.json" maxTokens)"
+  S2_PILOT_CONV="$conv"; S2_PILOT_SID="$t_sid"; S2_PROVIDER="$t_provider"
+  S2_MODEL="$t_model"; S2_REASONING_EFFORT="$t_reason"; S2_MAX_TOKENS="$t_max"
+  inputs_valid || die "stage receipt inputs invalid"
   req "current listener == staged candidate (receipt match)" \
       bash -c "[ \"\$(sha256sum \"$LISTENER_LIVE\" | cut -d' ' -f1)\" = \"$EXPECT_LISTENER_SHA\" ]" || die "live listener does not match stage receipt — inspect before restore-baseline"
   req "current plugin file == reviewed (receipt match)" \
       bash -c "[ \"\$(sha256sum \"$PLUGIN_FILE\" 2>/dev/null | cut -d' ' -f1)\" = \"$EXPECT_PLUGIN_SHA\" ]" || die "plugin state does not match stage receipt — inspect before restore-baseline"
-  req "composition row present (receipt match)" row_validate || die "composition does not match stage receipt — inspect before restore-baseline"
+  req "composition row present + matches receipt identity" row_validate || die "composition does not match stage receipt — inspect before restore-baseline"
   if ! rollback_full_baseline; then
     manifest_step restore-failed
     die "restore-baseline FAILED"
@@ -1177,7 +1212,10 @@ case "$MODE" in
   preflight)        run_preflight ;;
   stage)            run_stage ;;
   activate)         if run_activate; then :; else
-                      activate_failure_rollback || die "activate auto-rollback INDETERMINATE (manual recovery: route OLD + remove env/drop-in + restart inbound)"
+                      if ! activate_failure_rollback; then
+                        manifest_step rollback-failed
+                        die "activate auto-rollback INDETERMINATE (manual recovery: route OLD + remove env/drop-in + restart inbound)"
+                      fi
                       exit 1
                     fi ;;
   rollback)         run_rollback ;;
