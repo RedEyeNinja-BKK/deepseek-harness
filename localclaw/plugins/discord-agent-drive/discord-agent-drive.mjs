@@ -133,9 +133,10 @@ export function apply(ctx, entryConfig) {
   // ---- admission dedupe + outbound state ----
   const admitted = new Map()       // dshMessageId -> {observed, at}
   const pendingOutbound = []       // bounded queue of finalization frames
-  const outboundAcked = new Map()  // finalizationId -> ack at
+  const deliveredFids = new Set()  // authoritative delivered set from the shim ledger (hello)
   let shim = null
   let server = null
+  let deliveryOverflow = false
 
   // ---- per-session capture + turn reducer ----
   const sessions = new Map()
@@ -162,8 +163,16 @@ export function apply(ctx, entryConfig) {
     const turn = latestTurn(sessionEventLog(pilotSid))
     const fid = `${pilotSid}:${turn}:${kind}`
     const frame = { type: 'finalization', v: PROTOCOL_VERSION, conversationKey: pilotConv, sessionId: pilotSid, finalizationId: fid, kind, turn, facts }
-    if (outboundAcked.has(fid)) return // already acked (replay guard)
-    if (pendingOutbound.length >= MAX_PENDING_OUTBOUND) { evlog(`FINALIZATION DROPPED (bounded): ${fid}`); marker('outbound-overflow.json', frame); return }
+    if (deliveredFids.has(fid)) { evlog(`replay-skip (authoritative delivered set): ${fid}`); return }
+    if (pendingOutbound.length >= MAX_PENDING_OUTBOUND) {
+      // hard fault: never silently drop delivery work. Reject new admissions
+      // and record the dropped frame as indeterminate for the operator.
+      deliveryOverflow = true
+      route = 'QUIESCING_TO_OLD'
+      evlog(`FINALIZATION OVERFLOW (hard fault): ${fid}; admissions fenced`, 'error')
+      marker('outbound-overflow.json', frame)
+      return
+    }
     pendingOutbound.push(frame)
     flushOutbound()
   }
@@ -244,8 +253,8 @@ export function apply(ctx, entryConfig) {
       for (const m of d.inserted || []) {
         const mid = m?.id
         if (mid && String(mid).startsWith(DSH_MSG_PREFIX) && String(mid).includes(pilotConv)) {
-          admitted.set(mid, { observed: 'spliced', at: now() })
-          if (!isReplay) for (const w of [...admissionWaiters]) if (w.dshMessageId === mid) { w.resolve(); admissionWaiters.delete(w) }
+          const prev = admitted.get(mid)
+          admitted.set(mid, { ...(prev || {}), observed: 'spliced', at: now() })
         }
       }
       return
@@ -253,7 +262,12 @@ export function apply(ctx, entryConfig) {
     if (t === 'user/message') {
       const mid = d?.id
       const realUser = (d?.source || {}).kind === 'user'
-      if (mid && admitted.has(mid) && realUser) { admitted.set(mid, { ...admitted.get(mid), observed: 'claimed', at: now() }); if (!isReplay) for (const w of [...admissionWaiters]) if (w.dshMessageId === mid) { w.resolve(); admissionWaiters.delete(w) } }
+      if (mid && String(mid).startsWith(DSH_MSG_PREFIX) && realUser) {
+        const prev = admitted.get(mid) || { observed: null }
+        admitted.set(mid, { ...prev, observed: 'claimed', at: now() })
+        evlog(`CLAIM observed mid=${mid} waiters=${admissionWaiters.size}`)
+        if (!isReplay) for (const w of [...admissionWaiters]) if (w.dshMessageId === mid) { w.resolve('claimed'); admissionWaiters.delete(w) }
+      }
       if (realUser) { if (!s.cur) s.cur = freshTurnState(); s.cur.active = true }
       return
     }
@@ -309,16 +323,13 @@ export function apply(ctx, entryConfig) {
   // external delivered boundary (a durable turn number). Replay does NOT write
   // live evidence; duplicate finalization fids are suppressed by the shim ledger
   // (and by outboundAcked here).
-  function reconcile(boundaryTurn) {
-    evlog(`reconcile boundaryTurn=${boundaryTurn}`)
+  function reconcile(delivered) {
+    evlog(`reconcile deliveredCount=${delivered.length}`)
     const evs = sessionEventLog(pilotSid)
     sb(pilotSid).cur = null
     sessions.get(pilotSid).events = []
-    let last = 0
     for (const e of evs) {
       const t = e?.type
-      if (t === 'turn/end' && Number.isFinite(Number(e.data?.turn))) last = Number(e.data.turn)
-      if (t === 'turn/end' && last <= (boundaryTurn || 0)) continue
       if (['agent/inbox/spliced', 'user/message', 'assistant/chunk', 'tool/call', 'tool/result', 'assistant/message', 'turn/start', 'turn/end'].includes(t)) {
         handleSessionEvent(pilotSid, e, true)
       }
@@ -449,14 +460,16 @@ export function apply(ctx, entryConfig) {
     if (!frame || typeof frame !== 'object') { writeFrame(conn, { type: 'error', code: 'bad-frame' }); return }
     switch (frame.type) {
       case 'hello': {
-        const boundary = Number.isFinite(Number(frame.deliveredBoundaryTurn)) ? Math.max(0, Number(frame.deliveredBoundaryTurn)) : 0
+        const delivered = Array.isArray(frame.deliveredFinalizations) ? frame.deliveredFinalizations.filter((x) => typeof x === 'string') : []
+        for (const fid of delivered) deliveredFids.add(fid)
         shim = conn
-        if (route === 'S2_ACTIVE' && boundary > 0) reconcile(boundary)
+        if (delivered.length) reconcile(delivered)
         writeFrame(conn, { type: 'hello-ack', v: PROTOCOL_VERSION, route, pilotConversationKey: pilotConv, pilotSessionId: pilotSid })
         flushOutbound()
         break
       }
       case 'admitted': {
+        if (deliveryOverflow) { writeFrame(conn, { type: 'ack', for: 'admitted', discordMessageId: frame.discordMessageId, accepted: false, code: 'delivery-overflow', failClosed: true }); return }
         if (route !== 'S2_ACTIVE') { writeFrame(conn, { type: 'ack', for: 'admitted', discordMessageId: frame.discordMessageId, accepted: false, code: route === 'QUIESCING_TO_OLD' ? 'quiescing' : 'not-active' }); return }
         if (String(frame.conversationKey) !== pilotConv || String(frame.sessionId) !== pilotSid) {
           writeFrame(conn, { type: 'ack', for: 'admitted', discordMessageId: frame.discordMessageId, accepted: false, code: 'identity-mismatch', failClosed: true })
@@ -469,13 +482,26 @@ export function apply(ctx, entryConfig) {
         if (frame.dshMessageId && String(frame.dshMessageId) !== deterministic) { writeFrame(conn, { type: 'ack', for: 'admitted', discordMessageId: discordId, accepted: false, code: 'dsh-message-id-mismatch' }); return }
         if (admitted.has(deterministic)) {
           const rec = admitted.get(deterministic)
-          writeFrame(conn, { type: 'ack', for: 'admitted', discordMessageId: discordId, dshMessageId: deterministic, accepted: true, durable: true, observed: rec.observed, deduped: true })
+          if (rec.observed === 'claimed') {
+            writeFrame(conn, { type: 'ack', for: 'admitted', discordMessageId: discordId, dshMessageId: deterministic, accepted: true, durable: true, observed: 'claimed', deduped: true })
+          } else {
+            // already spliced but not yet claimed: wait for the claim, no resend
+            const waiterD = { dshMessageId: deterministic, resolve: () => {} }
+            const doneD = new Promise((res) => { waiterD.resolve = res })
+            admissionWaiters.add(waiterD)
+            await Promise.race([doneD.then(() => {}), delay(20000).then(() => {})])
+            admissionWaiters.delete(waiterD)
+            const rec2 = admitted.get(deterministic)
+            if (rec2?.observed === 'claimed') writeFrame(conn, { type: 'ack', for: 'admitted', discordMessageId: discordId, dshMessageId: deterministic, accepted: true, durable: true, observed: 'claimed', deduped: true })
+            else writeFrame(conn, { type: 'ack', for: 'admitted', discordMessageId: discordId, accepted: false, code: 'unclaimed-while-idle', ambiguous: true })
+          }
           return
         }
         const waiter = { dshMessageId: deterministic, resolve: null, discordId }
         waiter.resolve = () => {}
         const done = new Promise((res) => { waiter.resolve = res })
         admissionWaiters.add(waiter)
+        const claimedAt = admitted.get(deterministic)?.observed === 'claimed'
         const { agent, ownedByUs, error } = await resolveAgent()
         if (error || !agent) {
           admissionWaiters.delete(waiter)
@@ -491,19 +517,31 @@ export function apply(ctx, entryConfig) {
           writeFrame(conn, { type: 'ack', for: 'admitted', discordMessageId: discordId, accepted: false, code: 'followup-error', ambiguous: true })
           return
         }
-        // durable splice commits before followup() returns; the observer above
-        // resolves the waiter synchronously. Bounded wait guards a rare miss.
-        let observed = false
-        try { await Promise.race([done.then(() => { observed = true }), delay(1500).then(() => {})]) } catch {}
+        // ACK means BOTH durable facts are observed: the inbox splice (pending
+        // insertion, commits before live notify) AND the claimed model-facing
+        // user/message with the exact id (source.kind == user). A followup whose
+        // claim cannot be observed while the agent is idle is a native-lane
+        // failure -> ambiguous (no resend, evidence preserved).
+        let observed = claimedAt ? 'claimed' : null
+        if (!observed) {
+          try {
+            observed = await Promise.race([
+              done.then((v) => v || 'claimed'),
+              delay(20000).then(() => null),
+            ])
+          } catch { observed = null }
+        }
         admissionWaiters.delete(waiter)
-        if (observed) {
-          admitted.set(deterministic, { observed: 'spliced', at: now() })
-          writeFrame(conn, { type: 'ack', for: 'admitted', discordMessageId: discordId, dshMessageId: deterministic, accepted: true, durable: true, observed: 'spliced' })
-          evlog(`admission acked durable: ${deterministic}`)
+        const rec = admitted.get(deterministic)
+        if (observed && rec?.observed === 'claimed') {
+          admitted.set(deterministic, { ...rec, observed: 'claimed', at: now() })
+          writeFrame(conn, { type: 'ack', for: 'admitted', discordMessageId: discordId, dshMessageId: deterministic, accepted: true, durable: true, observed: 'claimed' })
+          evlog(`admission acked durable (claimed): ${deterministic}`)
         } else {
-          evlog(`admission AMBIGUOUS (no durable observation): ${deterministic}`)
-          marker('admission-ambiguous.json', { discordId, deterministic, at: now() })
-          writeFrame(conn, { type: 'ack', for: 'admitted', discordMessageId: discordId, accepted: false, code: 'ambiguous-no-durable-observation', ambiguous: true })
+          // spliced present but never claimed while idle -> native-lane failure
+          evlog(`admission AMBIGUOUS/UNCLAIMED (${rec?.observed || 'no durable'}): ${deterministic}`)
+          marker('admission-ambiguous.json', { discordId, deterministic, observed: rec?.observed || null, at: now() })
+          writeFrame(conn, { type: 'ack', for: 'admitted', discordMessageId: discordId, accepted: false, code: rec?.observed === 'spliced' ? 'unclaimed-while-idle' : 'ambiguous-no-durable-observation', ambiguous: true })
         }
         break
       }
@@ -530,7 +568,7 @@ export function apply(ctx, entryConfig) {
   function writeFrame(conn, obj) {
     try {
       const line = JSON.stringify(obj) + '\n'
-      if (Buffer.byteLength(line, 'utf8') > MAX_FRAME_BYTES) return false
+      if (Buffer.byteLength(line, 'utf8') > MAX_FRAME_BYTES) { evlog('writeFrame oversized (dropped+logged)'); return false }
       return conn.write(line)
     } catch { return false }
   }
@@ -544,7 +582,14 @@ export function apply(ctx, entryConfig) {
       let buf = ''
       conn.on('data', (chunk) => {
         buf += chunk.toString('utf8')
-        if (Buffer.byteLength(buf, 'utf8') > MAX_FRAME_BYTES * 2) { try { writeFrame(conn, { type: 'error', code: 'oversize' }) } catch {}; conn.destroy(); return }
+        // A single newline-delimited frame over MAX is invalid: reject as soon
+        // as the buffer exceeds MAX (no need to wait for the trailing newline).
+        if (Buffer.byteLength(buf, 'utf8') > MAX_FRAME_BYTES) {
+          try { writeFrame(conn, { type: 'error', code: 'oversize' }) } catch {}
+          conn.destroy()
+          evlog('oversize frame rejected (buffer exceeded MAX)')
+          return
+        }
         let idx
         while ((idx = buf.indexOf('\n')) >= 0) {
           const raw = buf.slice(0, idx)
@@ -585,6 +630,7 @@ export function apply(ctx, entryConfig) {
     evlog(`teardown route=${route} pending=${pendingOutbound.length} owned=${ownedHandle ? 'yes' : 'no'}`)
     const deadline = Date.now() + 2500
     while (pendingOutbound.length && Date.now() < deadline) await delay(50)
+    if (pendingOutbound.length) evlog(`teardown with ${pendingOutbound.length} unacked finalizations -> persisted indeterminate`, 'error')
     for (const f of pendingOutbound) marker('indeterminate-at-teardown.json', f)
     pendingOutbound.length = 0
     if (ownedHandle) {
