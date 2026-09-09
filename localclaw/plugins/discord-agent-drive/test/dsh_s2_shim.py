@@ -659,8 +659,8 @@ def c17(ledger, sink):
     return ok, {'before': before, 'after': after, 'media_ledger': ledger.media_delivered(CONV, ident)}
 
 
-@case('C19-outbound-lost-ack-text-delivers-once')
-def c19(ledger, sink):
+@case('C18-outbound-lost-ack-text-delivers-once')
+def c18(ledger, sink):
     # Outbound lost-ACK drill (ordinary text): shim receives the finalization but
     # drops the connection BEFORE ack/delivery; reconnect with the authoritative
     # delivered set (which excludes this fid) -> plugin reconciles and re-emits;

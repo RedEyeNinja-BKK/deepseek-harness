@@ -20,7 +20,8 @@ integration seam with native Agent semantics:
   suppresses duplicates (media by artifact identity, everything by
   `sessionId:turn:kind`);
 - reconciliation replays committed turns after the shim's authoritative delivered
-  boundary (`deliveredBoundaryTurn` on `hello`) with replay-only handling (no live
+  identity list (`deliveredFinalizations` on `hello`; replay-skip for every fid the
+  authoritative external ledger reports delivered) with replay-only handling (no live
   evidence duplication, no second DSH delivered ledger).
 
 Routing state machine OLD / S2_ACTIVE / QUIESCING_TO_OLD (route control frames) plus
@@ -52,7 +53,7 @@ model pin), `MessageId`/`freezeMessage`. No browser-facing `session.*` RPC anywh
 ```
 
 ## Seam (inbound / outbound), JSONL over AF_UNIX
-- inbound: `hello{deliveredBoundaryTurn}` / `route{state}` / `admitted{conversationKey,
+- inbound: `hello{deliveredFinalizations:[fid,…]}` / `route{state}` / `admitted{conversationKey,
   sessionId, discordMessageId, dshMessageId, authorId, content, attachmentRefs, ts}`
 - outbound: `hello-ack`, `route-ack`, `ack{for:'admitted'|'finalization', …}`,
   `finalization{conversationKey, sessionId, finalizationId: session:turn:kind, kind,

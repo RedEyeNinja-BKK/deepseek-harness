@@ -319,10 +319,10 @@ export function apply(ctx, entryConfig) {
     }
   }
 
-  // Reconciliation: replay committed turns after the shim's authoritative
-  // external delivered boundary (a durable turn number). Replay does NOT write
-  // live evidence; duplicate finalization fids are suppressed by the shim ledger
-  // (and by outboundAcked here).
+  // Reconciliation: replay committed turns; every finalization whose fid is in
+  // the shim's authoritative deliveredFinalizations identity list is suppressed
+  // (emitFinalization replay-skip). Replay never writes live evidence and never
+  // consults any plugin-side delivery authority.
   function reconcile(delivered) {
     evlog(`reconcile deliveredCount=${delivered.length}`)
     const evs = sessionEventLog(pilotSid)
@@ -547,8 +547,7 @@ export function apply(ctx, entryConfig) {
       }
       case 'ack': {
         if (frame.for === 'finalization' && frame.finalizationId) {
-          outboundAcked.set(frame.finalizationId, now())
-          evlog(`shim acked finalization ${frame.finalizationId}`)
+          evlog(`shim acked finalization ${frame.finalizationId} (transport observability only)`)
         }
         break
       }
