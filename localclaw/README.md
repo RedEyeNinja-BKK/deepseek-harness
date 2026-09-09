@@ -40,6 +40,8 @@ localclaw/
 │   ├── line/                 # LINE Messaging API webhook listener -> DSH session RPC
 │   ├── discord/              # Discord gateway listener + privileged send gate (socket) + MCP adapter
 │   └── webgate/              # public-destination-only web gate (CloakBrowser-backed) + MCP adapter
+├── plugins/
+│   └── schedule-boot-rearm/  # S1 native boot re-arm plugin (replaces the S-01 materializer oneshot)
 ├── gold/                     # daily Thai gold-market report definitions, charter,
 │                             # parity checker, analytical frameworks (MIT, see NOTICE)
 ├── systemd/dsh.service       # hardened main-service example
@@ -49,10 +51,19 @@ localclaw/
 
 ## What each piece does
 
-- **`config/cordis.patch.yml`** — five DSH-native composition inserts applied to all
+- **`config/cordis.patch.yml`** — DSH-native composition inserts applied to all
   profiles: a `thai_analyst` subagent (ThaiLLM Typhoon via an OpenAI-compatible
-  gateway, maxTokens 16384), a `webgate` MCP client, a `discord` MCP client, and the
-  upstream `schedule` and `time-context` plugins. No upstream files are touched.
+  gateway, maxTokens 16384), a `webgate` MCP client, a `discord` MCP client, the
+  upstream `schedule` and `time-context` plugins, and the `schedule-boot-rearm`
+  row (S1 native boot re-arm; see `plugins/schedule-boot-rearm/`). No upstream
+  files are touched.
+- **`plugins/schedule-boot-rearm/`** — in-process replacement for the retired
+  `dsh-scheduler-materialize` oneshot: after the `schedule` row, on every DSH
+  start it `ctx.agents.resume()`s each configured schedule-bearing session so
+  the native schedule plugin re-attaches its tools/runtime and persisted
+  schedules re-arm in-DSH. No scheduler semantics, no browser `session.*` RPC,
+  no gold special-casing. Ships a self-contained overlay battery
+  (`test/run-battery.sh`) for the pre-production proof.
 - **`integrations/line/`** — stdlib-only LINE webhook listener: HMAC signature
   verification, persistent conversation→session mapping, dedupe with durable
   fail-closed state, Push-API replies with idempotency keys, 4500-char chunking,

@@ -74,3 +74,15 @@
 - insert:
   - id: time-context
     name: '@deepseek-ai/dsh-time-context'
+- insert:
+  # S-01 native boot re-arm (native-plugin convergence slice 1): replaces the
+  # external dsh-scheduler-materialize oneshot. Canonical source:
+  # localclaw/plugins/schedule-boot-rearm/schedule-boot-rearm.mjs. Deployment
+  # copies that exact file to $DSH_HOME/plugins/schedule-boot-rearm.mjs and
+  # this row mounts the copy. After the schedule row, on every DSH start it
+  # ctx.agents.resume()s each schedule-bearing session so @deepseek-ai/dsh-schedule
+  # (which only installs on agents created after it loads) re-attaches tools and
+  # re-arms persisted schedule/change records in-DSH. No scheduler semantics,
+  # no browser session.* RPC, no gold special-casing. Ids below are the
+  # schedule-owner sessions (deployment state; the same list the oneshot read
+  # from DSH_SCHEDULE_SESSIONS).
