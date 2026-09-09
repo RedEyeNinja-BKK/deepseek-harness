@@ -24,6 +24,7 @@ against the reviewed constants, so fixtures must be the real files).
 | 2 | bad listener source hash | stage refuses, zero mutation |
 | 3 | bad binding (session map mismatch) | stage refuses, zero mutation |
 | 4 | bad session/pin (duplicate logs; pin mismatch) | stage refuses, zero mutation |
+| 16 | recorded non-empty reasoningEffort/maxTokens pins | stage PASS (real parity path) |
 | 5 | invalid operator inputs | stage refuses, zero mutation |
 | 6 | listener install/restart failure | full baseline rollback |
 | 7 | listener health failure after restart | full baseline rollback |

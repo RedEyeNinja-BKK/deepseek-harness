@@ -177,9 +177,20 @@ inputs_valid() { # returns 0/1; sets INPUTS_JSON
 }
 
 make_manifest() { # <label>
-  cat > "$TX/manifest.json" <<EOF
-{"mode":"$MODE","label":"$1","ts":"$TS","state":"created","stateAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","inputs":$INPUTS_JSON,"baselineLiveSha":"$EXPECT_LIVE_SHA","candidate":{"listener":"$EXPECT_LISTENER_SHA","seam":"$EXPECT_SEAM_SHA","plugin":"$EXPECT_PLUGIN_SHA"}}
-EOF
+  "$PY" - "$TX/manifest.json" "$MODE" "$1" "$TS" "$INPUTS_JSON" \
+      "$EXPECT_LIVE_SHA" "$EXPECT_LISTENER_SHA" "$EXPECT_SEAM_SHA" "$EXPECT_PLUGIN_SHA" <<'PY'
+import json,sys,datetime
+try:
+    utc=datetime.datetime.now(datetime.timezone.utc).isoformat()
+except Exception:
+    utc=datetime.datetime.utcnow().isoformat()+"Z"
+out,mode,label,ts,inputs,live,cl,cs,cp=sys.argv[1:10]
+d={"mode":mode,"label":label,"ts":ts,"state":"created","stateAt":utc,
+   "inputs":json.loads(inputs or "{}"),
+   "baselineLiveSha":live,
+   "candidate":{"listener":cl,"seam":cs,"plugin":cp}}
+json.dump(d,open(out,"w"),indent=2)
+PY
 }
 manifest_step() { # <state>
   "$PY" - "$TX/manifest.json" "$1" <<'PY'
@@ -454,7 +465,7 @@ environ_of() { # environ_of <pid> ; prints env lines
   if [ -n "${S2_GATE_PROC_DIR:-}" ]; then
     cat "${S2_GATE_PROC_DIR}/$1/environ" 2>/dev/null || true
   else
-    tr '\0' '\0' < "/proc/$1/environ" 2>/dev/null | tr '\0' '\n' || true
+    tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null || true
   fi
 }
 listener_env_has() { # listener_env_has <expected-conv> ; exact S2_PILOT_CONV presence
@@ -478,17 +489,18 @@ file_snapshot() { # file_snapshot <txn-file> <path>
   if [ -e "$2" ]; then cp -a "$2" "$1"; else printf 'ABSENT\n' > "$1"; fi
 }
 restore_snapshot() { # restore_snapshot <txn-file> <path> <mode> <owner> <group>
-  local src="$1" dst="$2" mode="$3" owner="$4" grp="$5"
+  local src="$1" dst="$2" mode="$3" owner="$4" grp="$5" tmp
   if grep -q '^ABSENT$' "$src" 2>/dev/null; then
     rm -f "$dst"
     log "restore: $dst removed (was absent)"
     return 0
   fi
   [ -f "$src" ] || { log "restore: no snapshot for $dst"; return 1; }
-  cp "$src" "$dst.tmp-restore"
-  chmod "$mode" "$dst.tmp-restore"
-  chown "$owner:$grp" "$dst.tmp-restore" 2>/dev/null || true
-  mv "$dst.tmp-restore" "$dst"
+  tmp="$dst.tmp-restore.$TS.$$"
+  cp "$src" "$tmp"
+  chmod "$mode" "$tmp"
+  chown "$owner:$grp" "$tmp" 2>/dev/null || true
+  mv "$tmp" "$dst"
   log "restore: $dst replaced"
 }
 
@@ -748,27 +760,38 @@ verify_post_mount_readiness() {
 # =============================================================================
 # ROLLBACK FUNCTIONS
 # =============================================================================
-rollback_full_baseline() { # full pre-S2 byte restore from this txn's snapshots
+rollback_full_baseline() { # full pre-S2 byte restore from this txn's snapshots (fail-closed)
   step "FULL baseline rollback from $TX"
   manifest_step rollback-start
-  local m_meta
+  local rb_ok=1
   rm -f "$ROUTE_FILE" "$ENV_FILE" "$DROPIN" "$TMPFILES_CONF"
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  if ! systemctl daemon-reload; then log "rollback: daemon-reload FAILED"; return 1; fi
   rm -rf "$SOCK_DIR"
-  # composition: restore prior patch bytes exactly (removes row when prior had none)
-  restore_snapshot "$TX/patch-prior.bin" "$PATCH_FILE" \
+  # every restoration step below is MANDATORY: any failure stops the rollback
+  # (never claim completion on partial restoration)
+  if ! restore_snapshot "$TX/patch-prior.bin" "$PATCH_FILE" \
       "$(awk '{print $1}' "$TX/patch-prior.meta" 2>/dev/null || echo 0644)" \
       "$(awk '{print $2}' "$TX/patch-prior.meta" 2>/dev/null || echo dsh)" \
-      "$(awk '{print $3}' "$TX/patch-prior.meta" 2>/dev/null || echo dsh)" || log "patch restore problem"
+      "$(awk '{print $3}' "$TX/patch-prior.meta" 2>/dev/null || echo dsh)"; then
+    log "rollback: patch restore FAILED"; rb_ok=0
+  fi
   rm -f "$PLUGIN_FILE"
-  restore_snapshot "$TX/listener-prior.bin" "$LISTENER_LIVE" \
+  if ! restore_snapshot "$TX/listener-prior.bin" "$LISTENER_LIVE" \
       "$(awk '{print $1}' "$TX/listener-prior.meta" 2>/dev/null || echo 0640)" \
       "$(awk '{print $2}' "$TX/listener-prior.meta" 2>/dev/null || echo dsh-discord)" \
-      "$(awk '{print $3}' "$TX/listener-prior.meta" 2>/dev/null || echo dsh-discord)" || log "listener restore problem"
-  restore_snapshot "$TX/helper-prior.bin" "$HELPER_LIVE" 0640 dsh-discord dsh-discord || log "helper restore problem"
+      "$(awk '{print $3}' "$TX/listener-prior.meta" 2>/dev/null || echo dsh-discord)"; then
+    log "rollback: listener restore FAILED"; rb_ok=0
+  fi
+  if ! restore_snapshot "$TX/helper-prior.bin" "$HELPER_LIVE" 0640 dsh-discord dsh-discord; then
+    log "rollback: helper restore FAILED"; rb_ok=0
+  fi
+  if [ "$rb_ok" != 1 ]; then
+    manifest_step rollback-failed
+    return 1
+  fi
   manifest_step rollback-bytes-restored
-  systemctl restart "$INBOUND_SERVICE" || log "inbound restart failed during rollback"
-  systemctl restart "$DSH_SERVICE" || log "dsh restart failed during rollback"
+  if ! systemctl restart "$INBOUND_SERVICE"; then log "rollback: inbound restart FAILED"; return 1; fi
+  if ! systemctl restart "$DSH_SERVICE"; then log "rollback: dsh restart FAILED"; return 1; fi
   sleep 5
   # plugin evidence dir removed too so a later baseline is byte-clean
   rm -rf "$PLUGIN_EVID_DIR"
@@ -978,6 +1001,7 @@ PY
   unit_health > "$TX/health-before.txt"
   local state_before
   state_before="$(state_hash)"
+  printf '%s' "$state_before" > "$TX/state-before.hash"
   manifest_step baseline
 
   # --- 1) persistent listener config (EnvironmentFile drop-in) ---
@@ -1051,23 +1075,41 @@ PY
   log "NEXT (operator): supervised live battery on the exact pilot. Rollback: $0 rollback (authority) / $0 restore-baseline (full bytes)."
 }
 
-activate_failure_rollback() { # auto rollback on activate failure -> staged OLD state
+activate_failure_rollback() { # auto rollback on activate failure -> staged OLD (fail-closed)
   log "activate failure -> auto rollback to staged OLD"
   manifest_step rollback-start
-  rm -f "$ENV_FILE" "$DROPIN"
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  local conv
+  conv="$(json_input "$TX/manifest.json" conv)"
+  # every rollback operation below is mandatory and verified
+  if ! rm -f "$ENV_FILE" "$DROPIN"; then log "rollback: could not remove env/drop-in"; return 1; fi
+  if ! systemctl daemon-reload; then log "rollback: daemon-reload FAILED"; return 1; fi
   if [ -f "$ROUTE_FILE" ]; then
-    local conv
-    conv="$(json_input "$TX/manifest.json" conv)"
-    "$PY" -c 'import json,sys;json.dump({sys.argv[1]:"OLD"},open(sys.argv[2],"w"))' \
-        "$conv" "$ROUTE_FILE"
+    "$PY" -c 'import json,sys;json.dump({sys.argv[1]:"OLD"},open(sys.argv[2],"w"))' "$conv" "$ROUTE_FILE"
     chown dsh-discord:dsh-discord "$ROUTE_FILE" 2>/dev/null || true
     chmod 0640 "$ROUTE_FILE"
   fi
-  systemctl restart "$INBOUND_SERVICE" || log "inbound restart failed during activate rollback"
-  run_hello_probe "" --route OLD >/dev/null 2>&1 || true
+  local pre_pid
+  pre_pid="$(inbound_mainpid)"
+  if ! systemctl restart "$INBOUND_SERVICE"; then log "rollback: inbound restart FAILED"; return 1; fi
+  sleep "$POST_RESTART_S"
+  # mandatory post-rollback verification
+  req "rollback: inbound healthy" unit_active "$INBOUND_SERVICE" || return 1
+  req "rollback: listener pid advanced" bash -c "[ \"$(inbound_mainpid)\" != \"$pre_pid\" ]" || return 1
+  req "rollback: listener env cleared (no S2_PILOT_CONV)" listener_env_clean || return 1
+  req "rollback: route absent or exact OLD" route_matches "$ROUTE_FILE" "$conv" OLD || return 1
+  if [ -f "$TX/state-before.hash" ]; then
+    req "rollback: inbound-state.json unchanged" [ "$(state_hash)" = "$(cat "$TX/state-before.hash")" ] || return 1
+  fi
+  # push + VERIFY plugin-side OLD (fail closed if the seam cannot be reached)
+  if ! run_hello_probe "" --route OLD "$TX/rollback-probe.json"; then
+    log "rollback: plugin route push/probe FAILED (indeterminate)"; return 1
+  fi
+  req "rollback: plugin route-ack OLD" \
+      "$PY" -c 'import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0 if d.get("ok") and (d.get("routeAck") or {}).get("state")=="OLD" else 1)' \
+      "$TX/rollback-probe.json" || return 1
+  unit_health > "$TX/health-after-rollback.txt"
   manifest_step rollback-complete
-  log "activate auto-rollback complete — staged OLD state restored (plugin mounted; route OLD)"
+  log "activate auto-rollback complete (verified) — staged OLD state restored (plugin mounted; route OLD)"
 }
 
 # =============================================================================
@@ -1100,10 +1142,30 @@ run_rollback() {
 
 run_restore_baseline() {
   log "=== S2 live gate RESTORE-BASELINE (full byte rollback to pre-S2) ==="
-  local stx
+  local stx conv
   stx="$(latest_stage_txn)" || die "no PASSED stage txn found to restore from"
   TX="$stx"
   log "restoring from stage txn $stx"
+  # authority constraint: refuse to restore baseline while a newer verified
+  # activate txn is still the ACTIVE authority (operator must rollback first)
+  local ax
+  for ax in $(ls -1dt "$EVID_BASE"/txn-* 2>/dev/null); do
+    [ "$ax" = "$stx" ] && break
+    if "$PY" - "$ax/manifest.json" <<'PY' >/dev/null 2>&1
+import json,sys
+m=json.load(open(sys.argv[1]))
+sys.exit(0 if m.get("mode")=="activate" and m.get("state")=="verified" else 1)
+PY
+    then die "a verified activate txn is newer than the stage receipt ($ax) — run: $0 rollback  first"; fi
+  done
+  # staged-identity constraint: current live state must match the receipt
+  conv="$(json_input "$stx/manifest.json" conv)"
+  S2_PILOT_CONV="$conv"
+  req "current listener == staged candidate (receipt match)" \
+      bash -c "[ \"\$(sha256sum \"$LISTENER_LIVE\" | cut -d' ' -f1)\" = \"$EXPECT_LISTENER_SHA\" ]" || die "live listener does not match stage receipt — inspect before restore-baseline"
+  req "current plugin file == reviewed (receipt match)" \
+      bash -c "[ \"\$(sha256sum \"$PLUGIN_FILE\" 2>/dev/null | cut -d' ' -f1)\" = \"$EXPECT_PLUGIN_SHA\" ]" || die "plugin state does not match stage receipt — inspect before restore-baseline"
+  req "composition row present (receipt match)" row_validate || die "composition does not match stage receipt — inspect before restore-baseline"
   if ! rollback_full_baseline; then
     manifest_step restore-failed
     die "restore-baseline FAILED"
@@ -1114,7 +1176,10 @@ run_restore_baseline() {
 case "$MODE" in
   preflight)        run_preflight ;;
   stage)            run_stage ;;
-  activate)         if run_activate; then :; else activate_failure_rollback; exit 1; fi ;;
+  activate)         if run_activate; then :; else
+                      activate_failure_rollback || die "activate auto-rollback INDETERMINATE (manual recovery: route OLD + remove env/drop-in + restart inbound)"
+                      exit 1
+                    fi ;;
   rollback)         run_rollback ;;
   restore-baseline) run_restore_baseline ;;
   *) echo "usage: $0 preflight|stage|activate|rollback|restore-baseline" >&2; exit 64 ;;

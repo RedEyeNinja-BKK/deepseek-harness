@@ -66,7 +66,7 @@ revision, 2026-09-09 — candidate application bytes unchanged). Modes:
     dsh_s2_live_gate.sh restore-baseline   # full byte rollback to pre-S2
 
 Transaction evidence is written under the report evidence dir (per-run txn).
-Hermetic regression battery: `test/gate/dsh_s2_gate_regression.sh` (116 checks).
+Hermetic regression battery: `test/gate/dsh_s2_gate_regression.sh` (121 checks).
 
 Old manual outline (superseded by the gate):
 1. Byte-verify staged == reviewed hashes.

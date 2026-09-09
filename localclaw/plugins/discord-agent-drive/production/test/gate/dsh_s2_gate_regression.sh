@@ -10,6 +10,13 @@
 
 set -u
 
+# The battery chgrps the overlay socket to group dsh-media; a recorded PASS
+# therefore implies the runner really is a member (self-proving evidence).
+id -nG | tr ' ' '\n' | grep -qx dsh-media || {
+  echo "battery requires membership in group dsh-media (overlay socket chgrp)" >&2
+  exit 1
+}
+
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE_DIR="$(cd "$HARNESS_DIR/../.." && pwd)"          # .../production
 GATE="$GATE_DIR/dsh_s2_live_gate.sh"
@@ -86,12 +93,14 @@ EOF
 EOF
 }
 
-write_durable() { # write_durable <session-dir>/<sid>/session.jsonl.zstd <provider> <model> [reasoning]
-  local path="$1" provider="$2" model="$3" reasoning="${4:-}"
-  local tmp="$path.raw"
+write_durable() { # write_durable <path> <provider> <model> [reasoning] [maxTokens]
+  local path="$1" provider="$2" model="$3" reasoning="${4:-}" maxtok="${5:-}"
+  local tmp="$path.raw" cfg="\"provider\":\"$provider\",\"model\":\"$model\""
+  if [ -n "$reasoning" ]; then cfg="$cfg,\"reasoningEffort\":\"$reasoning\""; fi
+  if [ -n "$maxtok" ]; then cfg="$cfg,\"maxTokens\":$maxtok"; fi
   mkdir -p "$(dirname "$path")"
   cat > "$tmp" <<EOF
-{"type":"request/header","data":{"header":{"config":{"provider":"$provider","model":"$model"}}}}
+{"type":"request/header","data":{"header":{"config":{$cfg}}}}
 {"type":"turn/start","data":{"turn":1}}
 {"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}
 EOF
@@ -275,6 +284,18 @@ EOF
 run_gate stage "$OV/gate.log"
 assert_rc "T04b stage refused (pin mismatch)" 1
 assert_grep "T04b zero-mutation message" "$OV/gate.log" "ZERO MUTATION"
+
+# T16 recorded non-empty reasoningEffort/maxTokens pin parity (not inferred)
+setup_overlay T16-pin-parity; ctl_conf; gate_env
+write_durable "$R/opt/dsh/home/sessions/ns-1/$SID/session.jsonl.zstd" "$PROV" "$MODEL" "high" "4096"
+gate_env
+S2_REASONING_EFFORT=high S2_MAX_TOKENS=4096 bash "$GATE" stage > "$OV/gate.log" 2>&1
+RC=$?
+assert_rc "T16 stage exit 0 (recorded reasoning/max parity)" 0
+assert_grep "T16 row carries reasoningEffort high" "$R/opt/dsh/home/cordis.patch.yml" "reasoningEffort: 'high'"
+assert_grep "T16 row carries maxTokens 4096" "$R/opt/dsh/home/cordis.patch.yml" "maxTokens: 4096"
+assert_absent "T16 route stays absent" "$R/var/lib/dsh-discord-inbound/s2-route.json"
+assert_present "T16 socket ready" "$R/run/dsh-discord-pilot/dsh.sock"
 
 # T05 invalid operator inputs -> stage zero mutation
 setup_overlay T05-bad-inputs; ctl_conf; gate_env
