@@ -5,8 +5,22 @@
 //  - gate-contract ok / failed / malformed variants;
 //  - the media / abnormal / conversational matrix;
 //  - deterministic caller-owned DSH message identity (spec §4).
-// Run from inside a scratch profile dir so '@deepseek-ai/*' resolves.
-import { decideFinalization, classifySendOutcome, dshMessageIdFor, admittedUserMessage, finalizationIdFor } from './discord-agent-drive.mjs'
+// Run from inside a scratch profile dir (or any dir where '@deepseek-ai/*'
+// resolves and the REAL plugin bytes sit next to this fixture) so the import
+// below loads the actual plugin. Proven invocation used by the r3 battery:
+//   cp ../discord-agent-drive.mjs ./   # (in the plugin test dir, repo tree)
+//   node reducer-and-identity.test.mjs
+// or, inside an evidence/config or scratch profile dir where plugin + fixture are
+// siblings and the profile node_modules farm provides '@deepseek-ai/*':
+//   node reducer-and-identity.test.mjs
+// The plugin import is layout-resilient (./ sibling OR ../ plugin dir).
+let plugin
+try {
+  plugin = await import('./discord-agent-drive.mjs')
+} catch {
+  plugin = await import('../discord-agent-drive.mjs')
+}
+const { decideFinalization, classifySendOutcome, dshMessageIdFor, admittedUserMessage, finalizationIdFor } = plugin
 
 let pass = 0, fail = 0
 function check(name, cond, detail = '') {
