@@ -49,6 +49,26 @@ without world access; mirrors the existing `/run/dsh-discord/gate.sock` pattern.
 Cutover gate must read back owner/group/mode before activating the route.
 
 ## Deployment at GO (operator; NOT done)
+
+Use the transactional live gate `dsh_s2_live_gate.sh` (gate-ONLY repair
+revision, 2026-09-09 — candidate application bytes unchanged). Modes:
+
+    # operator inputs are env vars (exact binding + captured pins):
+    #   S2_PILOT_CONV / S2_PILOT_SID / S2_PROVIDER / S2_MODEL
+    #   S2_REASONING_EFFORT / S2_MAX_TOKENS (optional)
+    dsh_s2_live_gate.sh preflight          # read-only baseline (no socket req.)
+    dsh_s2_live_gate.sh stage              # listener+helper+plugin/composition,
+                                           # setgid socket dir, ONE dsh restart,
+                                           # hello-only readiness probe; route OLD
+    dsh_s2_live_gate.sh activate           # needs PASSED stage; EnvironmentFile
+                                           # drop-in + route S2_ACTIVE + seam proof
+    dsh_s2_live_gate.sh rollback           # authority -> OLD (quiesce); env fence
+    dsh_s2_live_gate.sh restore-baseline   # full byte rollback to pre-S2
+
+Transaction evidence is written under the report evidence dir (per-run txn).
+Hermetic regression battery: `test/gate/dsh_s2_gate_regression.sh` (116 checks).
+
+Old manual outline (superseded by the gate):
 1. Byte-verify staged == reviewed hashes.
 2. `install dsh_discord_inbound.s2.py` as the listener (atomic replace + restart
    of dsh-discord-inbound only) and `install s2_seam.py` beside it; verify the
