@@ -71,7 +71,7 @@ YAML
 yaml_ok() { "$PY" -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$1" >/dev/null 2>&1; }
 
 row_present() { grep -q -- "- id: $PLUGIN_ROW_ID" "$PATCH_FILE"; }
-row_exact() { cmp -s <(printf '%s' "$ROW_BLOCK") <(tail -n 7 "$PATCH_FILE"); }
+row_exact() { cmp -s <(printf '%s\n' "$ROW_BLOCK") <(tail -n 7 "$PATCH_FILE"); }
 unit_enabled() { systemctl is-enabled "$UNIT" >/dev/null 2>&1; }
 unit_active()  { systemctl is-active  "$UNIT" >/dev/null 2>&1; }
 dsh_mainpid()  { systemctl show -p MainPID --value "$DSH_SERVICE" 2>/dev/null || echo 0; }
