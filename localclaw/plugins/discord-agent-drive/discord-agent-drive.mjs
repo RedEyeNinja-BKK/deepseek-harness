@@ -200,7 +200,7 @@ export function apply(ctx, entryConfig) {
     }
   }
   function realpathSafe(p) { try { return realpathSync(p) } catch { return p } }
-  const freshTurnState = () => ({ buf: [], send_calls: new Map(), send_files: new Map(), send_seen: false, media_calls: new Set(), media: new Map(), end_error: false, active: false })
+  const freshTurnState = () => ({ buf: [], send_calls: new Map(), send_files: new Map(), send_seen: false, media_calls: new Set(), media: new Map(), end_error: false, active: false, seamTurn: false })
   const isSendName = (nm) => { const s = (nm || '').toLowerCase(); return s.includes('send_message') || s.includes('discord') }
   const isMediaName = (nm) => (nm || '').toLowerCase().includes('generate_music')
   function reduceSendOutcomes(calls) {
@@ -277,13 +277,31 @@ export function apply(ctx, entryConfig) {
     if (t === 'user/message') {
       const mid = d?.id
       const realUser = (d?.source || {}).kind === 'user'
+      const seamOwned = realUser && mid && String(mid).startsWith(DSH_MSG_PREFIX)
       if (mid && String(mid).startsWith(DSH_MSG_PREFIX) && realUser) {
         const prev = admitted.get(mid) || { observed: null }
         admitted.set(mid, { ...prev, observed: 'claimed', at: now() })
         if (!isReplay) evlog(`CLAIM observed mid=${mid} waiters=${admissionWaiters.size}`)
         if (!isReplay) for (const w of [...admissionWaiters]) if (w.dshMessageId === mid) { w.resolve('claimed'); admissionWaiters.delete(w) }
       }
-      if (realUser) { if (!s.cur) s.cur = freshTurnState(); s.cur.active = true }
+      // One DSH-driving authority: the plugin owns finalization ONLY for turns
+      // it admitted over the seam (deterministic discord: ids). A non-seam
+      // real-user turn on the pilot session belongs to the old-path driver
+      // (e.g. during OLD rollback authority while the plugin is still mounted);
+      // it is observed but NEVER activated/finalized here, so the old backstop
+      // remains the sole fallback authority and no duplicate delivery occurs.
+      if (realUser && !seamOwned) {
+        if (!isReplay) evlog('non-seam user turn on pilot session observed (left to old-path authority)')
+        return
+      }
+      if (realUser && seamOwned) {
+        // Seam-owned turn: activate the accumulator AND mark it seam-owned so
+        // later content/tool events (which always follow their user message)
+        // can activate it. Non-seam turns never reach content activation.
+        if (!s.cur) s.cur = freshTurnState()
+        s.cur.seamTurn = true
+        s.cur.active = true
+      }
       return
     }
     if (t === 'turn/start') {
@@ -298,6 +316,10 @@ export function apply(ctx, entryConfig) {
     }
     const cur = s.cur
     if (!cur) return
+    // One DSH-driving authority: content only ever belongs to a seam-owned turn.
+    // A non-seam (old-path) turn on the pilot session must never activate the
+    // accumulator (turn/start creates it, but content must NOT bring it alive).
+    if (!cur.seamTurn) return
     if (t === 'assistant/chunk') {
       const c = d.chunk || {}
       cur.active = true

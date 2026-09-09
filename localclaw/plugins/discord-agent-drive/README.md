@@ -41,6 +41,16 @@ recovery therefore never depends on whether any outbound finalization has alread
 been delivered: a lost inbound ACK followed by a plugin/process restart still
 dedupes a retried event and never issues a second `followup()`.
 
+## One-DSH-driving-authority guard (r4, consumer integration)
+The plugin owns finalization ONLY for turns it admitted over the seam
+(deterministic `discord:` user-message ids). A non-seam real-user turn on the
+pilot session (the old-path driver, e.g. during OLD rollback authority while the
+plugin is still mounted) is observed but NEVER activated/finalized by the plugin
+(`turn/start` creates the accumulator but content cannot bring it alive unless
+the turn's user message was seam-owned). This makes OLD authority single-owner
+and prevents duplicate delivery when the plugin remains mounted. Guard probe:
+non-seam turn -> 0 finalization frames; seam turn -> exactly 1.
+
 Routing state machine OLD / S2_ACTIVE / QUIESCING_TO_OLD (route control frames) plus
 ownership rules: a live agent found via `ctx.agents.get` is borrowed and never
 disposed by S2; an agent this plugin resumed is owned and disposed at teardown only
@@ -112,9 +122,17 @@ already compose on the session).
   C20 reconnect-during-in-flight no-premature-finalization, C21 lost-inbound-ACK
   pre-restart staging; P01-P05 post-restart incl. P05 restart + EMPTY delivered
   set + retry dedupe; isolated scratch DSH).
-- `test/seed-pilot-session.mjs` — disposable seed that creates the pinned pilot
-  session (never in production).
-- Full results + evidence under the report tree (S2 r3 fix battery dir).
+- `test/old-path-driver.mjs` — OLD-authority guard probe (non-seam turn => 0
+  frames; seam turn => 1).
+- `production/test/s2_consumer_battery.py` — real production-consumer-candidate
+  battery (flag-empty 2/2; fake-seam UNIT 13/13; real-plugin INT 7/7).
+- Full results + evidence under the report tree (S2 r4 consumer dir).
+
+## Production consumer (cutover-gated)
+See `production/` (listener candidate + `s2_seam.py` helper + live gate +
+integration battery). The consumer is default-off (`S2_PILOT_CONV=""`); the
+plugin is mounted via the home profile patch row with `stubDiscordTool:false`;
+the live gate + supervised battery execute only at operator GO.
 
 ## Production integration direction (native-first; cutover-gated)
 No new daemon and no standalone client subsystem. The S2 plugin is the DSH-native
