@@ -53,10 +53,14 @@ function makeCtx(loader, agents) {
   const svcs = {}
   if (loader !== undefined) svcs.loader = loader
   if (agents) svcs.agents = agents
-  return {
+  // Cordis exposes injected services as ctx properties AND via ctx.get; mirror both.
+  const ctx = {
+    ...(loader !== undefined ? { loader } : {}),
+    ...(agents ? { agents } : {}),
     get(name) { return svcs[name] },
     logger: { info() {}, warn() {}, error() {}, debug() {} },
   }
+  return ctx
 }
 
 function makeHome(name) {
@@ -142,7 +146,7 @@ async function main() {
   const home = makeHome('case6-already-live')
   const oldHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
-  const agentsLive = { records: [], get() { return { session: { id: A } } }, roots() { return [{ session: { id: A } }] }, async resume(o) { this.records.push(o.resumeSessionId); return { agent: { session: { id: o.resumeSessionId, events: [] } } } } }
+  const agentsLive = { records: [], get(sid) { return sid === A ? { session: { id: A } } : undefined }, roots() { return [{ session: { id: A } }] }, async resume(o) { this.records.push(o.resumeSessionId); return { agent: { session: { id: o.resumeSessionId, events: [] } } } } }
   const loaderLive = loaderWithEntries(() => [{ options: { id: 'schedule' }, fiber: {} }])
   const ctxLive = makeCtx(loaderLive, agentsLive)
   const logLive = join(home, 'plugins', 'schedule-boot-rearm.log')
