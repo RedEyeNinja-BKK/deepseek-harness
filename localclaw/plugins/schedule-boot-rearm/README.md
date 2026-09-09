@@ -32,18 +32,20 @@ the same re-arm **in-process through the native lifecycle primitive**
 
 1. Reads its config list of schedule-owner session ids from the patch row
    (`scheduleSessionIds`).
-2. Waits until the loader tree is idle (schedule plugin is listening), then for
-   each id:
+2. STRICTLY fail-closed readiness: only once the `@deepseek-ai/dsh-schedule`
+   loader entry is positively observed **active** (its `agent/created` listener
+   installed) does it proceed — see “Readiness gate”.
+3. Then, for each id:
    - skips if the session is already live in this process (no duplicate);
    - validates the id exists in the native persistence index
      (`ctx.sessionPersistence.list()`), otherwise logs and skips (fail-narrow);
    - `ctx.agents.resume({ resumeSessionId, agentOptions, setup })`.
-3. The resume's `setup` installs the same agent-scoped model selection the host
+4. The resume's `setup` installs the same agent-scoped model selection the host
    materialization path installs (`installModelSelection` from
    `@deepseek-ai/dsh-agent`, reading the session's own last logged
    request/header config first) — so a resumed owner keeps its recorded model
    pin/effort (e.g. Terra) instead of silently falling back to the default.
-4. Logs one journal line per owner and a summary; owns nothing else.
+5. Logs one journal line per owner and a summary; owns nothing else.
 
 It never creates schedules, never writes schedule records, never deletes
 anything, never calls browser-facing `session.*` RPC, and never scans or
@@ -79,8 +81,32 @@ native persistence index before any resume.
 - Per-id, fail-narrow: a missing/invalid/failed id is logged and skipped; its
   persisted state is never deleted or replaced; one failure never blocks DSH
   startup (the summary line reports `failed=N` for health evidence).
-- Plugin unload leaves resumed agents live (a later instance only re-resumes
-  cold ids), so a hot reload cannot double-materialize or strand schedules.
+- On unload, agent-loop **owner-context teardown disposes the agents this
+  plugin instance resumed** (rc.2 native ownership — no parallel manual
+  ownership mechanism). Durable session state is untouched, so a later instance
+  resumes the same owners exactly once: no duplicate agent, no duplicate
+  schedule, no duplicate wake, no schedule occurrence emitted by the
+  unload/remount cycle.
+
+## Readiness gate (strictly fail-closed)
+
+rc.2 `@deepseek-ai/dsh-schedule` installs its runtime/tools only from its
+`agent/created` listener. If a cold persisted owner were resumed before that
+listener exists, the owner would become live **without** being re-armed, and
+later schedule activation never recreates the missed `agent/created` event.
+Resumes therefore happen ONLY after the schedule loader entry is positively
+observed active (`ctx.loader.entries()` entry with id/name
+`@deepseek-ai/dsh-schedule` and an installed fiber):
+
+- entry active → resume configured owners;
+- entry present but inactive until the 60s deadline → **no resume**;
+- entry absent / loader unobservable → **no resume**;
+- loader/readiness exception → **no resume**.
+
+Elapsed settling time is never treated as proof of readiness (a bounded loader
+appearance wait only waits for the loader *service*, never for the schedule
+listener). The external oneshot remains the rollback mechanism for a failed
+cutover, so fail-closed is the correct posture.
 
 ## Journal evidence
 
@@ -101,22 +127,28 @@ boot: done -> resumed=2 alreadyLive=0 missing=1 failed=0 invalid=0 (live roots=2
 
 `test/run-battery.sh` builds an isolated overlay (`$DSH_HOME` under `/tmp`),
 seeds synthetic schedule sessions against an anonymous loopback Switchyard
-gateway, simulates two DSH restarts with this plugin mounted, and asserts the
-GO §8 pre-production proofs (mount, resume, schedule re-arm, pin parity,
-idempotence, missing-target fail-narrow, no `session.*` RPC in source).
+gateway, and proves the GO §8 pre-production claims:
+
+- **phase 0** — readiness matrix (unit-level, no network): schedule active →
+  resume; present-but-inactive → no resume; absent → no resume; loader
+  unobservable → no resume; loader `entries()` throws → no resume; already-live
+  owner skipped (no duplicate).
+- **phase 1** — seed schedule-bearing session A (with a persisted model pin) +
+  control session C.
+- **phases 2–3** — two simulated DSH restarts with the plugin mounted: mount via
+  cordis patch, no browser `/api`/`session.*` RPC, `ctx.agents.resume`, native
+  `schedule_list` re-arms, persisted synthetic schedule survives, pin parity
+  (persisted model A retained while the deployment default switches to B),
+  idempotence across restarts, malformed/missing target fails narrow, control
+  session undisturbed, import allowlist respected.
+- **phase 4** — lifecycle (real boot): mount S1 → owners resume once → unload S1
+  → agent-loop owner-context teardown disposes the S1-owned agents → remount S1
+  → same owners resume exactly once; session identity, schedule rows, and
+  model/reasoning pin identical; no schedule occurrence emitted by
+  unload/remount.
+
 Requires the installed rc.2 tree (`/opt/dsh/node_modules/.bin/dsh`) and a
 reachable anonymous OpenAI-compatible gateway at `127.0.0.1:4000`.
-
-## Readiness gate
-
-Before any resume the plugin waits for the `@deepseek-ai/dsh-schedule` loader
-entry to become **active** (`ctx.loader.entries()` entry with an installed
-fiber), because schedule tools attach only to root agents created after the
-schedule plugin's `agent/created` listener is installed. If the entry is present
-but never activates within 60s the plugin fails closed (skips re-arm this
-start; the external oneshot remains the rollback path). If the loader
-entry-state API is unavailable or the entry is absent, it falls back to a short
-settle and proceeds with a warning.
 
 ## Known limitations and deferred work
 

@@ -174,6 +174,15 @@ then ok "import allowlist check"; else bad "import allowlist check"; fi
 if grep -q "ctx.agents.resume" "$PLUGIN"; then ok "plugin uses ctx.agents.resume"; else bad "plugin missing ctx.agents.resume"; fi
 if cmp -s "$PLUGIN" "$HOME_DIR/plugins/schedule-boot-rearm.mjs"; then ok "overlay copy byte-identical to canonical"; else bad "overlay copy drift"; fi
 
+# ---- readiness matrix (strict fail-closed; unit-level, no network) ----
+note "[phase 0] readiness matrix (fail-closed)"
+cp "$SRC_DIR/test/readiness-matrix.mjs" "$HOME_DIR/plugins/readiness-matrix.mjs"
+if node "$HOME_DIR/plugins/readiness-matrix.mjs" "$OVL/readiness"; then
+  ok "readiness matrix PASS (active->resume; inactive/absent/unobservable/throw->NO resume; already-live skip)"
+else
+  bad "readiness matrix FAIL"
+fi
+
 # ---- phase 2: restart with boot-rearm mounted; deployment default = MODEL_B ----
 note "[phase 2] restart #1 with boot-rearm (default model changed to B)"
 write_settings "$MODEL_B"
@@ -274,6 +283,51 @@ PY
   then ok "phase 3 assertions"; else bad "phase 3 assertions"; fi
 else
   bad "phase 3 evidence missing"
+fi
+
+note
+# ---- phase 4: lifecycle — in-process unload/remount ownership proof ----
+note "[phase 4] lifecycle: mount->resume->unload(dispose)->remount->resume-once"
+cp "$SRC_DIR/test/sbr-lifecycle-driver.mjs" "$HOME_DIR/plugins/sbr-lifecycle-driver.mjs"
+cat > "$HOME_DIR/cordis.patch.lifecycle.yml" <<EOF
+- insert:
+  - id: schedule
+    name: '@deepseek-ai/dsh-schedule'
+  - id: time-context
+    name: '@deepseek-ai/dsh-time-context'
+  - id: sbr-lifecycle
+    name: '$HOME_DIR/plugins/sbr-lifecycle-driver.mjs'
+EOF
+export SBR_MODE=lifecycle SBR_EVID="$EVID" SBR_SESSION_A="$SID_A" SBR_SESSION_C="$SID_C" \
+  SBR_PLUGIN="$HOME_DIR/plugins/schedule-boot-rearm.mjs" SBR_WS="$WS"
+boot p4 "$HOME_DIR/cordis.patch.lifecycle.yml" "$EVID/boot-p4.log" || { bad "phase4 boot launch"; exit 1; }
+if ! wait_evidence p4 COMPLETE-LIFECYCLE.json 360; then bad "phase4 lifecycle evidence"; stop_boot p4; fi
+sleep 2
+stop_boot p4
+LIFECYCLE="$EVID/COMPLETE-LIFECYCLE.json"
+if [ -s "$LIFECYCLE" ]; then
+  if python3 - "$LIFECYCLE" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+if "fatal" in d:
+    print("  fatal:", d["fatal"]); sys.exit(1)
+ok=True
+def chk(c,n):
+    global ok
+    print(("  PASS  " if c else "  FAIL  ")+n)
+    if not c: ok=False
+chk(d.get("disposedOnUnload") is True, "S1-owned resumed agents disposed on S1 unload (agent-loop teardown)")
+chk(d.get("durablePreservedAcrossUnload") is True, "durable session state preserved across unload")
+chk(d.get("sameIdentity") is True, "owner/session identity unchanged after remount")
+chk(d.get("rowsIdentical") is True, "schedule rows identical across unload/remount (no duplication)")
+chk(d.get("pinIdentical") is True, "model/reasoning pin identical across unload/remount")
+chk(d.get("resumeA")==2 and d.get("resumeC")==2, "each owner resumed exactly once per mount")
+chk(d.get("noScheduleOccurrenceEmitted") is True, "no schedule occurrence emitted by unload/remount")
+sys.exit(0 if ok else 1)
+PY
+  then ok "phase 4 lifecycle assertions"; else bad "phase 4 lifecycle assertions"; fi
+else
+  bad "phase 4 lifecycle evidence missing"
 fi
 
 note
