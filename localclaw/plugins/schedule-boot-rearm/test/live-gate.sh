@@ -249,8 +249,22 @@ gate() { # <label>
   systemctl is-active "$DSH_SERVICE" >/dev/null 2>&1 || die "dsh.service not active"
   if [ "$label" = gate1 ]; then
     row_present && die "gate1: plugin row already present (refusing double cutover)"
-    unit_enabled || die "gate1: external materializer not enabled (unexpected pre-state)"
-    unit_active  && die "gate1: external materializer active (unexpected pre-state)"
+    unit_enabled || die "gate1: external materializer not enabled (unexpected pre-state — old path must be authoritative before gate1)"
+    # The old materializer is intentionally the CURRENT authoritative re-arm
+    # mechanism before gate1: it already ran for the present boot and, being
+    # Type=oneshot RemainAfterExit=yes, legitimately sits in 'active (exited)'
+    # (Result=success) until the next dsh restart. That completed state does NOT
+    # mean it will execute during the upcoming gate restart — disable --now
+    # below makes it non-participating BEFORE the restart. Accept and log it;
+    # reject only a genuinely failed old path (Result != success).
+    if unit_active; then
+      RB_SUB="$(systemctl show "$UNIT" -p SubState --value 2>/dev/null || echo unknown)"
+      RB_RES="$(systemctl show "$UNIT" -p Result --value 2>/dev/null || echo unknown)"
+      log "gate1: external materializer active ($RB_SUB, Result=$RB_RES) — expected completed-oneshot state from the present boot; will be disabled before the gate restart"
+      [ "$RB_RES" = success ] || die "gate1: external materializer Result=$RB_RES (not success); refusing cutover on an unhealthy old path"
+    else
+      log "gate1: external materializer inactive — acceptable pre-state (still enabled/authoritative)"
+    fi
   else
     [ -f "$PLUGIN_FILE" ] || die "gate2: plugin file missing"
     [ "$(sha256sum "$PLUGIN_FILE" | cut -d' ' -f1)" = "$CANONICAL_SHA256" ] || die "gate2: plugin hash mismatch"
@@ -275,9 +289,12 @@ gate() { # <label>
 
   step "cutover: stop external authority, install native plugin, restart dsh"
   if [ "$label" = gate1 ]; then
+    # Disable the old materializer FIRST so it can never participate in the
+    # upcoming restart (no window where both S1 and S-01 are eligible).
     systemctl disable --now "$UNIT" >/dev/null 2>&1
     unit_enabled && die "failed to disable $UNIT"
     unit_active  && die "failed to stop $UNIT"
+    log "external materializer disabled + inactive (cannot participate in the gate restart)"
     # staged patch = original + row (temp file, then atomic replace)
     cp "$PATCH_FILE" "$TX/staged-patch.yml"
     printf '\n%s\n' "$ROW_BLOCK" >> "$TX/staged-patch.yml"
@@ -288,6 +305,15 @@ gate() { # <label>
   else
     log "gate2: plugin+row already authoritative; unit already disabled/inactive (asserted in preflight)"
   fi
+
+  # STRONG no-dual-authority invariant immediately before the restart: old
+  # materializer disabled+inactive AND native plugin file+row present.
+  if unit_enabled || unit_active; then
+    die "pre-restart invariant violated: external materializer still enabled/active — aborting before restart (rollback path applies)"
+  fi
+  [ -f "$PLUGIN_FILE" ] || die "pre-restart invariant violated: native plugin file missing before restart"
+  row_present || die "pre-restart invariant violated: native plugin row missing before restart"
+  log "pre-restart invariant OK: external materializer disabled+inactive; S1 sole re-arm authority"
 
   PRE_PID="$(dsh_mainpid)"
   systemctl restart "$DSH_SERVICE"
