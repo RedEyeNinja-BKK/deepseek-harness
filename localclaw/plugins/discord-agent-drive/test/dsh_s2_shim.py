@@ -143,6 +143,21 @@ def dup_fids(path):
     return {k: v for k, v in seen.items() if v > 1}
 
 
+def sink_fid_count(fid):
+    n = 0
+    try:
+        with open(SINK) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                r = json.loads(line)
+                if r.get('fid') == fid:
+                    n += 1
+    except FileNotFoundError:
+        pass
+    return n
+
+
 class ShimClient:
     """AF_UNIX JSONL client + reader thread."""
     def __init__(self, ledger, sink, hold_finalizations=False):
@@ -306,6 +321,35 @@ def _live_rows(kind):
     except FileNotFoundError:
         pass
     return out
+
+
+def _raw_rows(kind):
+    """Live-only rows from session-events-raw.jsonl (never written by replay)."""
+    out = []
+    try:
+        with open(os.path.join(EVID, 'session-events-raw.jsonl')) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                e = json.loads(line)
+                if e.get('type') == kind:
+                    out.append(e)
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def last_turn_end_turn():
+    rows = _live_rows('turn/end')
+    try:
+        return int(rows[-1].get('turn')) if rows else None
+    except (TypeError, ValueError):
+        return None
+
+
+def last_turn_end_reason():
+    rows = _live_rows('turn/end')
+    return (rows[-1].get('reason') or '') if rows else ''
 
 
 def count_user_occurrences(marker=None):
@@ -683,6 +727,117 @@ def c18(ledger, sink):
     return ok, {'before': before, 'after': after, 'dups': dups}
 
 
+@case('C19-multiturn-samekind-reconcile-exact-fids')
+def c19(ledger, sink):
+    # Review blocker 1 regression: two (here exactly two) historical turns of the
+    # SAME finalization kind (text-fallback) with DISTINCT durable turns must
+    # reconcile to TWO distinct FIDs - never one collapsed 'latest turn' FID.
+    # Exact expected owed FID set is asserted, delivery is per-identity, a replay
+    # of the owed set happens exactly once, and a further replay adds zero sends.
+    c = fresh_client(ledger, sink, hold=True)
+    c.request({'type': 'route', 'state': 'S2_ACTIVE'})
+    ok1 = c.admit(CONV, SID, '9195', 'Marker C19A-FID. Reply with exactly: C19A-OK. Do not call any tools.')  # noqa: E501
+    ok1 = ok1.get('accepted') is True
+    wait_for(lambda: len(c.finalization_log) >= 1, timeout=150)
+    ta = last_turn_end_turn()
+    n1 = len(c.finalization_log)
+    ok2 = c.admit(CONV, SID, '9196', 'Marker C19B-FID. Reply with exactly: C19B-OK. Do not call any tools.')  # noqa: E501
+    ok2 = ok2.get('accepted') is True
+    wait_for(lambda: len(c.finalization_log) >= n1 + 1, timeout=150)
+    tb = last_turn_end_turn()
+    c.close()  # both fids held (never ledgered) -> both owed on the next hello
+    kinds = sorted(f.get('kind') for f in c.finalization_log[-2:])
+    held_fids = sorted(f.get('finalizationId') for f in c.finalization_log[-2:])
+    expected = sorted([f'{SID}:{ta}:text-fallback', f'{SID}:{tb}:text-fallback'])
+    distinct_turns = ta is not None and tb is not None and ta != tb
+    same_kind = len(set(kinds)) == 1
+    before_sink = sink.count()
+    c2 = fresh_client(ledger, sink)  # authoritative delivered set excludes the two held fids
+    time.sleep(4)
+    emitted = sorted(f.get('finalizationId') for f in c2.finalization_log)
+    after_sink = sink.count()
+    ok3 = emitted == expected
+    ok4 = (after_sink - before_sink) == 2 and not dup_fids(SINK)
+    # replay again (both fids now in the authoritative delivered set) -> zero sends
+    before2 = sink.count()
+    c3 = fresh_client(ledger, sink)
+    time.sleep(4)
+    ok5 = len(c3.finalization_log) == 0 and sink.count() == before2
+    c2.close(); c3.close()
+    ok = ok1 and ok2 and distinct_turns and same_kind and ok3 and ok4 and ok5
+    return ok, {'ta': ta, 'tb': tb, 'kinds': kinds, 'held_fids': held_fids, 'expected': expected, 'emitted': emitted, 'sink_delta': after_sink - before_sink, 'replay2_delta': sink.count() - before2}
+
+
+@case('C20-reconnect-inflight-open-turn-no-premature-finalization')
+def c20(ledger, sink):
+    # Review blocker 2 regression: a shim reconnect during a legitimate running
+    # turn must NOT manufacture an abnormal finalization for the open tail.
+    c = fresh_client(ledger, sink)
+    c.request({'type': 'route', 'state': 'S2_ACTIVE'})
+    before_turns = count_turns()
+    before_sink = sink.count()
+    before_tool = len(_raw_rows('tool/call'))
+    ack = c.admit(CONV, SID, '9205', 'Marker C20-INFLIGHT. Call s2_delay with ms 15000. After the delay completes, reply with exactly: C20-OK.')  # noqa: E501
+    ok1 = ack.get('accepted') is True
+    # prove the turn is durably in flight (tool call dispatched, tool still running)
+    in_flight = wait_for(lambda: len(_raw_rows('tool/call')) > before_tool, timeout=120) is not None
+    time.sleep(1.0)
+    c.close()  # disconnect while the tool turn is still running
+    c2 = fresh_client(ledger, sink)  # reconnect; reconcile runs at hello
+    time.sleep(5)  # open turn still has ~10s of tool delay left: premature finalization would surface now
+    mid_fin = len(c2.finalization_log)
+    mid_sink = sink.count()
+    ok_open = (mid_fin == 0) and (mid_sink == before_sink)
+    # real durable completion
+    completed = wait_for(lambda: count_turns() >= before_turns + 1, timeout=180) is not None
+    wait_for(lambda: len(c2.finalization_log) >= 1, timeout=90)
+    time.sleep(3)
+    finals = [f for f in c2.finalization_log if f.get('kind') in ('noop', 'text-fallback', 'artifact', 'failure-notice')]
+    t_last = last_turn_end_turn()
+    reason_last = last_turn_end_reason()
+    ok_fin = len(finals) == 1 and finals[0].get('turn') == t_last and not (finals[0].get('facts') or {}).get('abnormal')
+    expected_sink = 1 if finals and finals[0].get('kind') != 'noop' else 0
+    ok_sink = (sink.count() - mid_sink) == expected_sink and not dup_fids(SINK)
+    c2.close()
+    ok = ok1 and in_flight and ok_open and completed and ok_fin and ok_sink and reason_last == 'completed'
+    return ok, {'ok1': ok1, 'in_flight': in_flight, 'mid_fin': mid_fin, 'mid_sink': mid_sink, 'completed': completed, 'finals_turns': [f.get('turn') for f in finals], 't_last': t_last, 'reason': reason_last, 'sink_delta': sink.count() - mid_sink, 'expected_sink': expected_sink}
+
+
+@case('C21-stage-lost-inbound-ack-pre-restart')
+def c21(ledger, sink):
+    # Review blocker 3 staging phase (pre-restart half): admit E/M, prove durable
+    # claim, drop the connection BEFORE the inbound ACK is consumed, let the model
+    # turn complete, and ensure NO finalization is recorded as delivered. The
+    # post-restart half (P05) reconnects with deliveredFinalizations=[] and must
+    # dedupe the retry from rebuilt durable history.
+    c = fresh_client(ledger, sink, hold=True)
+    c.request({'type': 'route', 'state': 'S2_ACTIVE'})
+    before_occ = count_user_occurrences('C21-RESTART')
+    before_turns = count_turns()
+    before_sink = sink.count()
+    before_led = len(ledger.delivered_fids(CONV))
+    # raw send; the admission ACK frame is never read by this client (lost ACK)
+    c.send({'type': 'admitted', 'conversationKey': CONV, 'sessionId': SID,
+            'discordMessageId': '9211', 'dshMessageId': dsh_id('9211'),
+            'authorId': '222222222222222222', 'content': 'Marker C21-RESTART. Reply with exactly: C21-OK. Do not call any tools.',
+            'attachmentRefs': [], 'ts': int(time.time())})
+    claimed = wait_for(lambda: count_user_occurrences('C21-RESTART') - before_occ >= 1, timeout=60) is not None
+    done_turn = wait_for(lambda: count_turns() >= before_turns + 1, timeout=180) is not None
+    held = wait_for(lambda: len(c.finalization_log) >= 1, timeout=60) is not None
+    time.sleep(2)
+    c.close()
+    ok_undelivered = (sink.count() == before_sink) and (len(ledger.delivered_fids(CONV)) == before_led)
+    fin = [f for f in c.finalization_log if f.get('kind') != 'noop'] or c.finalization_log
+    fid = fin[0].get('finalizationId') if fin else None
+    turn = fin[0].get('turn') if fin else None
+    occ_delta = count_user_occurrences('C21-RESTART') - before_occ
+    with open(os.path.join(EVID, 'restart-state.json'), 'w') as fh:
+        json.dump({'c21_discord_id': '9211', 'c21_fid': fid, 'c21_turn': turn,
+                   'occ_delta': occ_delta, 'turn_delta': count_turns() - before_turns}, fh, indent=2)
+    ok = claimed and done_turn and held and ok_undelivered and bool(fid and turn) and occ_delta == 1
+    return ok, {'claimed': claimed, 'done_turn': done_turn, 'held': held, 'ok_undelivered': ok_undelivered, 'fid': fid, 'turn': turn, 'occ_delta': occ_delta, 'turn_delta': count_turns() - before_turns}
+
+
 def post_restart(ledger, sink):
     """Plugin-restart continuation: same DSH_HOME re-booted; hello carries the
     authoritative delivered set; reconcile replays nothing missing; new admission
@@ -692,6 +847,37 @@ def post_restart(ledger, sink):
     def add(name, ok, detail):
         res.append({'case': name, 'pass': bool(ok), 'detail': detail})
         log(('PASS ' if ok else 'FAIL ') + name)
+
+    # P05 first: restart hole (review blocker 3) - reconnect with an EMPTY
+    # delivered set after a lost inbound ACK + process restart.
+    st = {}
+    try:
+        with open(os.path.join(EVID, 'restart-state.json')) as f:
+            st = json.load(f)
+    except Exception:
+        pass
+    if not st.get('c21_fid'):
+        add('P05-restart-empty-delivered-lost-ack', False, 'restart-state.json missing c21_fid')
+        return all(r['pass'] for r in res)
+    fid, turn = st['c21_fid'], st.get('c21_turn')
+    before_occ = count_user_occurrences('C21-RESTART')
+    before_turns = count_turns()
+    c5 = ShimClient(ledger, sink)
+    ack5 = c5.connect([])  # EMPTY delivered set: admission rebuild must not depend on outbound state
+    add('P05a-hello-empty-delivered', ack5.get('type') == 'hello-ack', ack5)
+    wait_for(lambda: sink_fid_count(fid) >= 1, timeout=120)
+    time.sleep(3)
+    add('P05b-owed-finalization-delivered-once', sink_fid_count(fid) == 1 and not dup_fids(SINK), {'fid': fid, 'sink': sink_fid_count(fid)})
+    # enter the active route BEFORE the retry (the plugin boots OLD; new admits are gated)
+    ra5 = c5.request({'type': 'route', 'state': 'S2_ACTIVE'})
+    ok_route5 = ra5.get('type') == 'route-ack' and ra5.get('state') == 'S2_ACTIVE'
+    ack_r = c5.admit(CONV, SID, st.get('c21_discord_id', '9211'), 'Marker C21-RESTART. Reply with exactly: C21-OK. Do not call any tools.')  # noqa: E501
+    ok_dedup = ack_r.get('accepted') is True and ack_r.get('deduped') is True and ack_r.get('durable') is True and ack_r.get('observed') == 'claimed'
+    time.sleep(5)
+    occ_delta = count_user_occurrences('C21-RESTART') - before_occ
+    turn_delta = count_turns() - before_turns
+    add('P05c-retry-deduped-no-second-followup', ok_route5 and ok_dedup and occ_delta == 0 and turn_delta == 0, {'route': ra5, 'ack': ack_r, 'occ_delta': occ_delta, 'turn_delta': turn_delta, 'sink_fid': sink_fid_count(fid)})
+    c5.close()
 
     before_sink = sink.count()
     before_turns = count_turns()

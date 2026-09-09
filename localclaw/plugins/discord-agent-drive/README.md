@@ -24,10 +24,29 @@ integration seam with native Agent semantics:
   authoritative external ledger reports delivered) with replay-only handling (no live
   evidence duplication, no second DSH delivered ledger).
 
+## Finalization identity (exact durable turn)
+`finalizationId = sessionId:turn:kind` where `turn` is the EXACT durable turn the
+finalization represents (its own `turn/end`, falling back to the turn number captured
+at its own `turn/start`). The identity is never derived from a whole-log latest-turn
+scan: during reconciliation multiple historical turns of the same kind would
+otherwise collapse onto one FID and the external delivered set would suppress owed
+older finalizations as duplicates. During an ordinary reconnect an in-flight (open)
+turn at the log tail is RETAINED, never finalized as abnormal — its real durable
+`turn/end` finalizes it exactly once.
+
+## Admission-index rebuild (restart-safe)
+The in-memory admission dedupe index is rebuilt from authoritative session history on
+EVERY `hello`, including an empty `deliveredFinalizations` list. Inbound duplicate
+recovery therefore never depends on whether any outbound finalization has already
+been delivered: a lost inbound ACK followed by a plugin/process restart still
+dedupes a retried event and never issues a second `followup()`.
+
 Routing state machine OLD / S2_ACTIVE / QUIESCING_TO_OLD (route control frames) plus
 ownership rules: a live agent found via `ctx.agents.get` is borrowed and never
 disposed by S2; an agent this plugin resumed is owned and disposed at teardown only
-after fence/drain/quiesce.
+after fence/drain/quiesce. Reconciliation materializes the pinned session
+(get | resume, no create) when needed so durable history is readable even right
+after a DSH process restart.
 
 ## Supported rc.2 surfaces used
 `ctx.agents.get/resume`, `ctx.on('session/event')`, `agent.followup`,
@@ -59,7 +78,22 @@ model pin), `MessageId`/`freezeMessage`. No browser-facing `session.*` RPC anywh
   `finalization{conversationKey, sessionId, finalizationId: session:turn:kind, kind,
   turn, facts}`; errors `{type:'error', code}`.
 Frame cap 1 MiB; bounded outbound queue (500); stale-socket cleanup + 0660 socket in a
-dedicated dir (owner/group per service model, see live-gate).
+dedicated dir. Socket dir/socket group is a service-to-service shared group (see
+`test/README` + live-gate): the DSH plugin (user `dsh`) creates the socket; the
+Discord inbound consumer is a different service user, and both already share an
+existing group so the client connects without world access (`0770` dir + `0660`
+socket).
+
+## Delivery guarantee (honest wording)
+The shim ledger is two-phase: a finalization is durably begun (pending) BEFORE the
+external send and marked delivered after it. A replay of a `pending` fid is
+INDETERMINATE and never auto-resent (prevents an automatic duplicate after an
+ambiguous crash). Across the unavoidable send/commit crash window (`pending`
+committed -> crash -> external send never happened) the semantics are **at-most-once
+automatic external send with durable fail-visible INDETERMINATE state**, not
+unconditional exactly-once visible delivery. Pending state stays surfaced in the
+ledger and is persisted as indeterminate evidence for the operator. No transaction
+coordinator or broker is introduced to close that window.
 
 ## Isolation-only stub
 `stubDiscordTool: true` registers `mcp__discord__send_message`,
@@ -69,24 +103,28 @@ text-block array, `execute`). Production MUST keep this false (real D-01 MCP too
 already compose on the session).
 
 ## Tests
-- `test/reducer-and-identity.test.mjs` — 23/23 (deterministic id, gate-contract
-  classifier incl. a real captured rc.2 tool/result text, decision matrix).
-- `test/dsh_s2_shim.py` — seam battery driver (15 cases pre-restart, 4 post-restart;
-  isolated scratch DSH).
+- `test/reducer-and-identity.test.mjs` — 30/30 (deterministic id incl. E-series
+  finalization-identity: distinct FIDs per durable turn, no latest-turn
+  collapse; gate-contract classifier incl. a real captured rc.2 tool/result text;
+  decision matrix).
+- `test/dsh_s2_shim.py` — seam battery driver (C01-C21 pre-restart incl. the three
+  review-blocker regressions: C19 multi-turn same-kind exact-FID reconcile,
+  C20 reconnect-during-in-flight no-premature-finalization, C21 lost-inbound-ACK
+  pre-restart staging; P01-P05 post-restart incl. P05 restart + EMPTY delivered
+  set + retry dedupe; isolated scratch DSH).
 - `test/seed-pilot-session.mjs` — disposable seed that creates the pinned pilot
   session (never in production).
-- Full results + evidence under the report tree (S2 seam battery dir).
+- Full results + evidence under the report tree (S2 r3 fix battery dir).
 
-## Production integration (cutover, SEPARATE GO — not done)
-1. Capture read-only exact pilot `channel:<id>`/`thread:<id>`, mapped `sessionId`,
-   durable provider/model/reasoning from the pilot session's request/header.
-2. Add a small `s2_client.py` in the inbound listener (`/opt/dsh-inbound`) that owns
-   the AF_UNIX client + route flag `S2_PILOT_CONV`; when the flag equals the pilot
-   conversation the listener skips ALL historical DSH-driving/backstop paths for that
-   conversation and uses the seam instead (one DSH-driving authority + one fallback
-   authority + the shared Discord send authority).
-3. Mount the plugin row; boot; supervised live battery; rollback = one route flag
-   disable through QUIESCING_TO_OLD then OLD (plugin unmount optional cleanup).
+## Production integration direction (native-first; cutover-gated)
+No new daemon and no standalone client subsystem. The S2 plugin is the DSH-native
+side (mounted via the home profile patch row, exactly like the S1 boot-rearm plugin;
+`stubDiscordTool:false`). The only boundary crossing is the AF_UNIX seam itself; the
+production consumer is the SMALLEST surgical reuse inside the existing
+`/opt/dsh-inbound` listener — its own native ledger + Discord send authority + D-01
+gate — routed by the pilot-conversation equality flag. That listener delta is
+authored, Hermes-reviewed and byte-captured as part of the cutover GO; no production
+mutation happens before that GO.
 
 ## Rollback
 No identity translation, no ledger merge: flip `S2_PILOT_CONV` off (quiesce/fence

@@ -6,7 +6,7 @@
 //  - the media / abnormal / conversational matrix;
 //  - deterministic caller-owned DSH message identity (spec §4).
 // Run from inside a scratch profile dir so '@deepseek-ai/*' resolves.
-import { decideFinalization, classifySendOutcome, dshMessageIdFor, admittedUserMessage } from './discord-agent-drive.mjs'
+import { decideFinalization, classifySendOutcome, dshMessageIdFor, admittedUserMessage, finalizationIdFor } from './discord-agent-drive.mjs'
 
 let pass = 0, fail = 0
 function check(name, cond, detail = '') {
@@ -64,6 +64,22 @@ check('C10 send ok delivered file -> noop (file suppressed)', dupDelivered.kind 
 const realOutcome = classifySendOutcome(realOkText, false)
 const realTurn = d1('', [{ cid: 'call_00_5YCPH1F8RFf4i4Suawde6687', outcome: realOutcome }], { call_00_5YCPH1F8RFf4i4Suawde6687: [] }, true, [], false, 16)
 check('D1 real send-ok turn -> noop (no duplicate fallback)', realTurn.kind === 'noop')
+
+// ---- E. finalization identity (review blocker 1): exact durable turn, never
+// a latest-turn scan. Same kind on different durable turns MUST produce distinct
+// FIDs so reconciliation cannot collapse historical turns onto one identity. ----
+const fidA = finalizationIdFor(sid, 10, 'text-fallback')
+const fidB = finalizationIdFor(sid, 11, 'text-fallback')
+check('E1 same kind distinct turns -> distinct FIDs (no collision)', fidA !== fidB)
+check('E2 FID format session:turn:kind', fidA === `${sid}:10:text-fallback` && fidB === `${sid}:11:text-fallback`)
+check('E3 same turn different kinds -> distinct FIDs', finalizationIdFor(sid, 10, 'noop') !== fidA)
+check('E4 same inputs deterministic', finalizationIdFor(sid, 10, 'text-fallback') === fidA)
+check('E5 turn preserved in identity (older turn never masked by newer)', !fidA.includes(':11:') && !fidB.includes(':10:'))
+// Replay-owed set semantics: two historical same-kind turns replay to the exact
+// owed identity set, never one collapsed FID repeated.
+const owedAfterReplay = new Set([fidA, fidB].map((f) => f))
+check('E6 owed replay set has both distinct identities', owedAfterReplay.size === 2)
+check('E7 each finalization maps to its own durable turn', fidA.split(':')[1] === '10' && fidB.split(':')[1] === '11')
 
 console.log(`\nTOTAL ${pass}/${pass + fail}`)
 process.exit(fail ? 1 : 0)

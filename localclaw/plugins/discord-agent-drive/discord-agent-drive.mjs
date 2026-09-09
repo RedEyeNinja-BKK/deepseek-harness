@@ -56,6 +56,14 @@ const now = () => new Date().toISOString()
 export function dshMessageIdFor(conversationKey, discordMessageId) {
   return MessageId(`${DSH_MSG_PREFIX}${conversationKey}:${discordMessageId}`)
 }
+// Deterministic finalization identity: exact session + exact durable turn +
+// finalization kind. The external delivered ledger keys on this identity, so it
+// MUST be built from the durable turn the finalization actually represents —
+// never from a global "latest turn" scan (reconciliation replays historical
+// turns; a latest-turn scan collapses same-kind finalizations onto one FID).
+export function finalizationIdFor(sessionId, turn, kind) {
+  return `${sessionId}:${turn}:${kind}`
+}
 // createUserMessage() re-randomizes the id every call; freezeMessage() preserves
 // the caller-owned stable identity (proven against installed dsh-llm).
 export function admittedUserMessage(conversationKey, discordMessageId, envelopeText, clientTimeZone) {
@@ -159,9 +167,16 @@ export function apply(ctx, entryConfig) {
     }
     return max
   }
-  function emitFinalization(kind, facts) {
-    const turn = latestTurn(sessionEventLog(pilotSid))
-    const fid = `${pilotSid}:${turn}:${kind}`
+  function emitFinalization(turn, kind, facts) {
+    // FID invariant: exact session + exact durable turn + kind. The turn is the
+    // authoritative durable turn supplied by the reducer/finalization facts; it
+    // is NEVER derived from a latest-turn scan of the whole session log.
+    if (!(Number.isInteger(turn) && turn > 0)) {
+      evlog(`finalization skipped: no exact durable turn (kind=${kind}) -> evidence preserved, no manufactured identity`)
+      marker('finalization-no-durable-turn.json', { kind, facts, at: now() })
+      return
+    }
+    const fid = finalizationIdFor(pilotSid, turn, kind)
     const frame = { type: 'finalization', v: PROTOCOL_VERSION, conversationKey: pilotConv, sessionId: pilotSid, finalizationId: fid, kind, turn, facts }
     if (deliveredFids.has(fid)) { evlog(`replay-skip (authoritative delivered set): ${fid}`); return }
     if (pendingOutbound.length >= MAX_PENDING_OUTBOUND) {
@@ -230,7 +245,7 @@ export function apply(ctx, entryConfig) {
       end_error: cur.end_error,
       turn: turnNo,
     })
-    emitFinalization(decision.kind, decision.facts)
+    emitFinalization(turnNo, decision.kind, decision.facts)
   }
 
   // ---- per-turn event reducer (streaming over durable session events) ----
@@ -265,14 +280,18 @@ export function apply(ctx, entryConfig) {
       if (mid && String(mid).startsWith(DSH_MSG_PREFIX) && realUser) {
         const prev = admitted.get(mid) || { observed: null }
         admitted.set(mid, { ...prev, observed: 'claimed', at: now() })
-        evlog(`CLAIM observed mid=${mid} waiters=${admissionWaiters.size}`)
+        if (!isReplay) evlog(`CLAIM observed mid=${mid} waiters=${admissionWaiters.size}`)
         if (!isReplay) for (const w of [...admissionWaiters]) if (w.dshMessageId === mid) { w.resolve('claimed'); admissionWaiters.delete(w) }
       }
       if (realUser) { if (!s.cur) s.cur = freshTurnState(); s.cur.active = true }
       return
     }
     if (t === 'turn/start') {
-      if (s.cur?.active) { s.cur.end_error = true; finalizeTurn(sid, s.cur, d.turn ?? latestTurn(sessionEventLog(sid))); s.cur = null }
+      // Abnormal live overlap (a new turn/start while the previous turn is still
+      // active): the interrupted turn is finalised under ITS OWN durable turn
+      // (cur._turn) — never under the new turn's number and never under a
+      // latest-turn scan.
+      if (s.cur?.active) { s.cur.end_error = true; finalizeTurn(sid, s.cur, s.cur._turn ?? null); s.cur = null }
       s.cur = freshTurnState()
       s.cur._turn = d.turn ?? null
       return
@@ -314,7 +333,10 @@ export function apply(ctx, entryConfig) {
     } else if (t === 'turn/end') {
       const reason = (d.reason || {}).kind || ''
       if (reason && reason !== 'completed') cur.end_error = true
-      if (cur.active) finalizeTurn(sid, cur, d.turn ?? cur._turn)
+      // Exact durable turn of THIS end event (its own turn number, falling back
+      // to the turn number captured at its own turn/start). No latest-turn scan.
+      const turnNo = Number.isInteger(Number(d.turn)) ? Number(d.turn) : (cur._turn ?? null)
+      if (cur.active) finalizeTurn(sid, cur, turnNo)
       s.cur = null
     }
   }
@@ -323,8 +345,24 @@ export function apply(ctx, entryConfig) {
   // the shim's authoritative deliveredFinalizations identity list is suppressed
   // (emitFinalization replay-skip). Replay never writes live evidence and never
   // consults any plugin-side delivery authority.
-  function reconcile(delivered) {
+  //
+  // Runs on EVERY hello (including an empty delivered set) so the in-memory
+  // admission index is rebuilt from authoritative session history: inbound
+  // duplicate recovery must not be coupled to whether any outbound finalization
+  // has already been delivered (a lost inbound ACK + restart must still dedupe).
+  //
+  // An in-flight (open) turn at the log tail is RETAINED, never finalised as
+  // abnormal: absence of turn/end at EOF is not evidence of abnormal completion
+  // during an ordinary reconnect. Its real durable turn/end finalizes it later.
+  async function reconcile(delivered) {
     evlog(`reconcile deliveredCount=${delivered.length}`)
+    // Materialize the pinned session (get | resume; NO create) so durable
+    // history is readable even right after a DSH process restart. This is
+    // materialization only — reconcile never drives the session.
+    if (!ctx.agents.get(pilotSid)) {
+      const r = await resolveAgent()
+      if (r.error || !r.agent) evlog(`reconcile: pilot session not materialized (${r.error || 'no-agent'}); history replay degraded`)
+    }
     const evs = sessionEventLog(pilotSid)
     sb(pilotSid).cur = null
     sessions.get(pilotSid).events = []
@@ -334,7 +372,8 @@ export function apply(ctx, entryConfig) {
         handleSessionEvent(pilotSid, e, true)
       }
     }
-    if (sessions.get(pilotSid)?.cur?.active) { sessions.get(pilotSid).cur.end_error = true; finalizeTurn(pilotSid, sessions.get(pilotSid).cur, null) }
+    const tail = sessions.get(pilotSid)?.cur
+    if (tail?.active) evlog(`reconcile: open turn tail retained (start turn=${tail._turn ?? 'unknown'}) — finalization waits for the real durable turn/end`)
     evlog('reconcile done')
   }
 
@@ -463,7 +502,7 @@ export function apply(ctx, entryConfig) {
         const delivered = Array.isArray(frame.deliveredFinalizations) ? frame.deliveredFinalizations.filter((x) => typeof x === 'string') : []
         for (const fid of delivered) deliveredFids.add(fid)
         shim = conn
-        if (delivered.length) reconcile(delivered)
+        await reconcile(delivered)
         writeFrame(conn, { type: 'hello-ack', v: PROTOCOL_VERSION, route, pilotConversationKey: pilotConv, pilotSessionId: pilotSid })
         flushOutbound()
         break
