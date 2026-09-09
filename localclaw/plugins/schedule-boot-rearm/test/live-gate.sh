@@ -134,8 +134,18 @@ unit_health() { # prints name=status lines
 # ---------------- transaction manifest ----------------
 make_manifest() { # <label>
   cat > "$TX/manifest.json" <<EOF
-{"label":"$1","ts":"$TS","pluginSha256":"$CANONICAL_SHA256","sidA":"$SID_A","sidB":"$SID_B"}
+{"label":"$1","ts":"$TS","state":"created","stateAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","pluginSha256":"$CANONICAL_SHA256","sidA":"$SID_A","sidB":"$SID_B"}
 EOF
+}
+manifest_step() { # <manifest.json> <state>
+  "$PY" - "$1" "$2" <<'PY'
+import json,sys,datetime
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+d["state"]=sys.argv[2]
+d["stateAt"]=datetime.datetime.utcnow().isoformat()+"Z"
+json.dump(d,open(sys.argv[1],"w"),indent=2)
+PY
 }
 latest_txn() { ls -1dt "$EVID"/txn-* 2>/dev/null | head -1 || true; }
 
@@ -165,12 +175,11 @@ install_plugin() {
 }
 
 # ---------------- readiness ----------------
-wait_boot_complete() { # <timeout-s>  waits for a FRESH plugin log with exact success summary
-  local n=0 t="$1" pre_pid post_pid
-  pre_pid="$(dsh_mainpid)"
+wait_boot_complete() { # <timeout-s> <old-pid>  waits for a FRESH plugin log with exact success summary
+  local n=0 t="$1" old_pid="$2" post_pid
   while [ "$n" -lt "$t" ]; do
     post_pid="$(dsh_mainpid)"
-    if [ "$post_pid" != "$pre_pid" ] && [ "$post_pid" != "0" ] \
+    if [ -n "$post_pid" ] && [ "$post_pid" != "0" ] && [ "$post_pid" != "$old_pid" ] \
        && [ -s "$PLUGIN_LOG" ] \
        && tail -6 "$PLUGIN_LOG" 2>/dev/null | grep -q "boot: done -> resumed=2 alreadyLive=0 missing=0 failed=0 invalid=0" \
        && tail -6 "$PLUGIN_LOG" 2>/dev/null | grep -q "live roots=2"; then
@@ -186,13 +195,17 @@ wait_boot_complete() { # <timeout-s>  waits for a FRESH plugin log with exact su
 verify_gate() { # <label>
   local label="$1"
   "$PY" - "$label" "$TX" "$SID_A" "$SID_B" <<'PY'
-import json,sys
+import json,sys,os,re
 label,tx,a,b=sys.argv[1:5]
 ok=True
 def chk(c,n):
     global ok
     print(("  PASS  " if c else "  FAIL  ")+n)
     if not c: ok=False
+# evidence integrity: every required artifact present and non-empty
+required=[f"{label}-baseline.json",f"{label}-post.json","pluginlog-after.log","health-after.txt","patch-before.yml","materializer-before.txt","materializer-after.txt"]
+missing=[f for f in required if not (os.path.exists(f"{tx}/{f}") and os.path.getsize(f"{tx}/{f}")>0)]
+chk(not missing, "evidence integrity (all artifacts present+non-empty)")
 pre=json.load(open(f"{tx}/{label}-baseline.json"))
 post=json.load(open(f"{tx}/{label}-post.json"))
 txt=open(f"{tx}/pluginlog-after.log",encoding='utf-8',errors='replace').read()
@@ -200,21 +213,20 @@ health=dict(l.split("=",1) for l in open(f"{tx}/health-after.txt").read().splitl
 pa=pre.get(a,{}).get("pins"); qa=post.get(a,{}).get("pins")
 pb=pre.get(b,{}).get("pins"); qb=post.get(b,{}).get("pins")
 chk("schedule plugin entry active" in txt and "boot: done" in txt, "1 plugin loaded through DSH lifecycle")
-ok_ab=all(f"resume ok: {s}" in txt for s in (a,b))
-chk(ok_ab, "2 persisted schedule owners resumed (same session ids)")
+chk(all(f"resume ok: {s}" in txt for s in (a,b)), "2 persisted schedule owners resumed (same session ids)")
 chk("live roots = 2" in txt, "3 schedule runtime re-attached (live roots = 2)")
 chk(pa==qa and isinstance(pa,dict) and bool(pa.get("model")), f"4 model pin unchanged for A ({pa.get('model') if pa else None})")
+chk(pb==qb and isinstance(pb,dict) and bool(pb.get("model")), f"4b model pin unchanged for B ({pb.get('model') if pb else None})")
 chk(bool(pre.get(b,{}).get("present")) and bool(post.get(b,{}).get("present")), "5 successor session present exactly once (single durable log)")
 chk(pre.get(a,{}).get("scheduleRows")==post.get(a,{}).get("scheduleRows") and pre.get(b,{}).get("scheduleRows")==post.get(b,{}).get("scheduleRows"), "6 next-fire schedule state unchanged (full normalized rows, both sessions)")
 chk(pre.get(a,{}).get("dispatches")==post.get(a,{}).get("dispatches") and pre.get(b,{}).get("dispatches")==post.get(b,{}).get("dispatches"), "7 no restart-induced schedule dispatch (both sessions)")
-import re
 resumes=re.findall(r"resume ok: (session-[0-9a-f-]+)",txt)
 chk(sorted(set(resumes))==sorted([a,b]) and len(resumes)==2, "8 no duplicate owner/session (exactly one resume per owner)")
-chk(pre.get(a,{}).get("scheduleRows")==post.get(a,{}).get("scheduleRows") and pre.get(b,{}).get("scheduleRows")==post.get(b,{}).get("scheduleRows"), "9 no duplicate schedule records (both sessions)")
-units=[u for u,s in health.items()]
-states=[s for u,s in health.items()]
-chk(sorted(units)==sorted(["dsh.service","dsh-line-inbound","dsh-discord-inbound","dsh-discord","dsh-webgate"]) and all(s=="active" for s in states), "10 platform units active: "+", ".join(f"{u}={s}" for u,s in health.items()))
-json.dump({"ok":ok,"resumeLines":resumes,"health":health},open(f"{tx}/{label}-VERDICT.json","w"))
+chk(pre.get(a,{}).get("scheduleRows")==post.get(a,{}).get("scheduleRows") and pre.get(b,{}).get("scheduleRows")==post.get(b,{}).get("scheduleRows"), "9 no duplicate/new schedule records (full normalized equality, both sessions)")
+units=sorted(health.keys())
+states=[health[u] for u in units]
+chk(units==sorted(["dsh.service","dsh-line-inbound","dsh-discord-inbound","dsh-discord","dsh-webgate"]) and all(s=="active" for s in states), "10 platform units active: "+", ".join(f"{u}={health[u]}" for u in units))
+json.dump({"ok":ok,"resumeLines":resumes,"health":health,"evidenceMissing":missing},open(f"{tx}/{label}-VERDICT.json","w"))
 sys.exit(0 if ok else 1)
 PY
 }
@@ -226,6 +238,7 @@ gate() { # <label>
   make_manifest "$label"
 
   step "preflight (read-only)"
+  manifest_step "$TX/manifest.json" preflight
   [ -f "$CANONICAL_SRC" ] || die "canonical source missing"
   [ "$(sha256sum "$CANONICAL_SRC" | cut -d' ' -f1)" = "$CANONICAL_SHA256" ] || die "canonical source hash mismatch"
   [ -f "$PATCH_FILE" ] || die "patch file missing"
@@ -243,11 +256,10 @@ gate() { # <label>
     unit_enabled && die "gate2: external materializer still enabled"
     unit_active  && die "gate2: external materializer still active"
     g1v="$(ls -1 "$EVID"/txn-*/gate1-VERDICT.json 2>/dev/null | head -1 || true)"
-    if [ -n "$g1v" ]; then
-      grep -q '"ok": true' "$g1v" 2>/dev/null || die "previous gate1 did not PASS; refusing gate2"
-    else
-      log "gate2: no prior gate1 manifest found; proceeding per operator intent"
+    if [ -z "$g1v" ]; then
+      die "gate2: no prior gate1 manifest found — gate2 is the idempotence gate AFTER a PASSED gate1"
     fi
+    grep -q '"ok": true' "$g1v" 2>/dev/null || die "previous gate1 did not PASS; refusing gate2"
   fi
 
   step "baseline capture"
@@ -256,6 +268,7 @@ gate() { # <label>
   cp "$PATCH_FILE" "$TX/patch-before.yml"
   echo "enabled=$(unit_enabled && echo yes || echo no) active=$(unit_active && echo yes || echo no)" > "$TX/materializer-before.txt"
   if [ -f "$PLUGIN_LOG" ]; then mv "$PLUGIN_LOG" "$TX/pluginlog-pre.log"; fi
+  manifest_step "$TX/manifest.json" baseline
 
   step "cutover: stop external authority, install native plugin, restart dsh"
   if [ "$label" = gate1 ]; then
@@ -268,23 +281,26 @@ gate() { # <label>
     yaml_ok "$TX/staged-patch.yml" || die "staged patch invalid"
     patch_atomic_install "$TX/staged-patch.yml"
     install_plugin
+    manifest_step "$TX/manifest.json" cutover-installed
   else
     log "gate2: plugin+row already authoritative; unit already disabled/inactive (asserted in preflight)"
   fi
 
-  local pre_pid
-  pre_pid="$(dsh_mainpid)"
+  PRE_PID="$(dsh_mainpid)"
   systemctl restart "$DSH_SERVICE"
-  wait_boot_complete 300 || die "plugin boot evidence not observed (fresh log + exact summary)"
+  wait_boot_complete 300 "$PRE_PID" || die "plugin boot evidence not observed (fresh log + exact summary)"
   sleep 3
+  manifest_step "$TX/manifest.json" restarted
 
   step "post capture + verify"
   session_state "$TX/$label-post.json"
   unit_health > "$TX/health-after.txt"
   echo "enabled=$(unit_enabled && echo yes || echo no) active=$(unit_active && echo yes || echo no)" > "$TX/materializer-after.txt"
   cp "$PLUGIN_LOG" "$TX/pluginlog-after.log"
+  manifest_step "$TX/manifest.json" post-captured
 
   if verify_gate "$label"; then
+    manifest_step "$TX/manifest.json" verified
     log "$label VERDICT: PASS"
   else
     log "$label VERDICT: FAIL"
@@ -306,6 +322,8 @@ case "$MODE" in
     RB_TX="$(latest_txn)"
     [ -n "$RB_TX" ] && [ -f "$RB_TX/manifest.json" ] || die "no transaction manifest to roll back"
     step "rollback from $RB_TX"
+    manifest_step "$RB_TX/manifest.json" rollback-start
+    [ -f "$RB_TX/patch-original.yml" ] || die "rollback: patch-original.yml missing from txn"
     # 1) make sure the external unit cannot run while the plugin still exists
     systemctl disable "$UNIT" >/dev/null 2>&1 || true
     systemctl stop "$UNIT" >/dev/null 2>&1 || true
@@ -313,9 +331,11 @@ case "$MODE" in
     cp "$RB_TX/patch-original.yml" "$PATCH_FILE.s1-rb-tmp-$TS"
     yaml_ok "$PATCH_FILE.s1-rb-tmp-$TS" || die "rollback patch invalid"
     row_present && grep -q -- "- id: $PLUGIN_ROW_ID" "$PATCH_FILE.s1-rb-tmp-$TS" && die "rollback patch still contains row"
+    cmp -s "$PATCH_FILE.s1-rb-tmp-$TS" "$RB_TX/patch-original.yml" || die "rollback patch byte mismatch vs manifest"
     chown dsh:dsh "$PATCH_FILE.s1-rb-tmp-$TS"; chmod 0644 "$PATCH_FILE.s1-rb-tmp-$TS"
     mv "$PATCH_FILE.s1-rb-tmp-$TS" "$PATCH_FILE"
     rm -f "$PLUGIN_FILE"
+    manifest_step "$RB_TX/manifest.json" rollback-native-removed
     # 3) restart DSH with NO materializer (plugin removed, unit stopped) -> clean state
     systemctl restart "$DSH_SERVICE"
     sleep 5
@@ -331,8 +351,30 @@ case "$MODE" in
     done
     [ "$(systemctl show -p Result --value "$UNIT" 2>/dev/null)" = success ] || die "external oneshot did not complete successfully"
     log "external oneshot re-enabled and completed"
+    manifest_step "$RB_TX/manifest.json" rollback-oneshot-ok
     session_state "$RB_TX/rollback-state.json"
     unit_health > "$RB_TX/rollback-health.txt"
+    # 5) continuity: schedule rows + model pins unchanged vs gate1 baseline (old-path state)
+    if [ -f "$RB_TX/gate1-baseline.json" ]; then
+      if "$PY" - "$RB_TX" "$SID_A" "$SID_B" <<'PY'
+import json,sys
+rb,a,b=sys.argv[1:4]
+base=json.load(open(f"{rb}/gate1-baseline.json")); now=json.load(open(f"{rb}/rollback-state.json"))
+ok=True
+for s in (a,b):
+    if base[s].get("scheduleRows")!=now[s].get("scheduleRows") or base[s].get("pins")!=now[s].get("pins"):
+        print(f"  FAIL  rollback continuity {s}: schedule rows or pins changed vs gate1 baseline"); ok=False
+    else:
+        print(f"  PASS  rollback continuity {s}: schedule rows + pins unchanged vs gate1 baseline")
+sys.exit(0 if ok else 1)
+PY
+      then log "rollback continuity verified"
+      else log "rollback continuity MISMATCH (see above)"; die "rollback continuity check failed"
+      fi
+    else
+      log "rollback: no gate1 baseline in this txn (pre-gate rollback); continuity compare skipped"
+    fi
+    manifest_step "$RB_TX/manifest.json" rollback-complete
     log "rollback complete (evidence: $RB_TX)"
     ;;
 esac
